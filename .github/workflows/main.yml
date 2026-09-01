@@ -4,6 +4,8 @@ on:
   push:
     branches: [ main ]
   workflow_dispatch:  # cho phép chạy thủ công từ tab Actions
+  schedule:
+    - cron: "0 */6 * * *"  # chạy tự động mỗi 6 tiếng (giờ UTC)
 
 jobs:
   run-script:
@@ -19,7 +21,9 @@ jobs:
 
       - name: Install dependencies
         run: |
-          pip install -r requirements.txt   # nếu có file requirements.txt
+          pip install -r requirements.txt
 
       - name: Run script
+        env:
+          MONGO_URI: ${{ secrets.MONGO_URI }}
         run: python crawl_job.py
