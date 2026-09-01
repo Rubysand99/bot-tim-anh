@@ -1,7 +1,5 @@
 import os
-import re
 import time
-import requests
 import discord
 from discord import app_commands
 from discord.ext import commands
@@ -26,86 +24,23 @@ async def on_ready():
 
 
 # ============================================================
-# Command cũ: !img (DuckDuckGo) — vẫn giữ để đối chiếu/test
+# Lệnh ping — kiểm tra độ trễ của bot
 # ============================================================
 
-def get_duckduckgo_image(query: str):
-    headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
-        'Accept-Language': 'en-US,en;q=0.5',
-        'Referer': 'https://duckduckgo.com/'
-    }
-
-    session = requests.Session()
-    session.headers.update(headers)
-
-    res = session.get("https://duckduckgo.com/", params={'q': query}, timeout=10)
-    vqd_match = re.search(r'vqd=([\d-]+)\&', res.text)
-    if not vqd_match:
-        vqd_match = re.search(r'vqd=["\']([\d-]+)["\']', res.text)
-
-    if not vqd_match:
-        raise Exception("Không thể lấy VQD Token từ DuckDuckGo")
-
-    vqd = vqd_match.group(1)
-
-    params = {
-        'l': 'wt-wt',
-        'o': 'json',
-        'q': query,
-        'vqd': vqd,
-        'f': ',,,',
-        'p': '1'
-    }
-
-    image_res = session.get("https://duckduckgo.com/i.js", params=params, timeout=10)
-    data = image_res.json()
-
-    results = data.get("results", [])
-    if results:
-        return results[0].get("image")
-    return None
+@bot.tree.command(name="ping", description="Kiểm tra độ trễ của bot")
+async def ping_slash(interaction: discord.Interaction):
+    latency_ms = round(bot.latency * 1000)
+    await interaction.response.send_message(f"🏓 Pong! Độ trễ: **{latency_ms}ms**")
 
 
-@bot.command(name="img", help="Tìm kiếm hình ảnh (DuckDuckGo)")
-async def search_image(ctx, *, query: str):
-    await ctx.typing()
-
-    def fetch():
-        for attempt in range(3):
-            try:
-                img_url = get_duckduckgo_image(query)
-                if img_url:
-                    return img_url
-            except Exception as err:
-                if attempt < 2:
-                    time.sleep(2)
-                else:
-                    raise err
-        return None
-
-    try:
-        img_url = await bot.loop.run_in_executor(None, fetch)
-
-        if not img_url:
-            await ctx.send(f"❌ Không tìm thấy hình ảnh cho: **{query}**")
-            return
-
-        embed = discord.Embed(
-            title=f"🖼️ Kết quả hình ảnh: {query}",
-            color=discord.Color.green()
-        )
-        embed.set_image(url=img_url)
-        embed.set_footer(text="Nguồn: DuckDuckGo via Requests")
-        await ctx.send(embed=embed)
-
-    except Exception as e:
-        await ctx.send(f"⚠️ Lỗi khi tải ảnh: `{e}`")
+@bot.command(name="ping", help="Kiểm tra độ trễ của bot")
+async def ping_prefix(ctx):
+    latency_ms = round(bot.latency * 1000)
+    await ctx.send(f"🏓 Pong! Độ trễ: **{latency_ms}ms**")
 
 
 # ============================================================
-# Command mới: /timanh (Pinterest) — slash command + nút chuyển ảnh
+# Lệnh /img và !img (Pinterest) — slash command + prefix + nút chuyển ảnh
 # ============================================================
 
 class ImagePaginator(discord.ui.View):
@@ -162,16 +97,20 @@ class ImagePaginator(discord.ui.View):
                 pass
 
 
-@bot.tree.command(name="timanh", description="Tìm ảnh trên Pinterest theo từ khóa")
+async def _search_pinterest(query: str):
+    """Chạy crawler Pinterest trong executor để không block event loop."""
+    def fetch():
+        return search_pinterest_images_with_retry(query, limit=20, retries=3)
+    return await bot.loop.run_in_executor(None, fetch)
+
+
+@bot.tree.command(name="img", description="Tìm ảnh trên Pinterest theo từ khóa")
 @app_commands.describe(tu_khoa="Từ khóa cần tìm ảnh")
-async def timanh(interaction: discord.Interaction, tu_khoa: str):
+async def img_slash(interaction: discord.Interaction, tu_khoa: str):
     await interaction.response.defer()
 
-    def fetch():
-        return search_pinterest_images_with_retry(tu_khoa, limit=20, retries=3)
-
     try:
-        images = await bot.loop.run_in_executor(None, fetch)
+        images = await _search_pinterest(tu_khoa)
     except Exception as e:
         await interaction.followup.send(f"⚠️ Lỗi khi tìm ảnh trên Pinterest: `{e}`")
         return
@@ -182,6 +121,25 @@ async def timanh(interaction: discord.Interaction, tu_khoa: str):
 
     view = ImagePaginator(tu_khoa, images, interaction.user.id)
     message = await interaction.followup.send(embed=view.build_embed(), view=view, wait=True)
+    view.message = message
+
+
+@bot.command(name="img", help="Tìm ảnh trên Pinterest theo từ khóa")
+async def img_prefix(ctx, *, query: str):
+    await ctx.typing()
+
+    try:
+        images = await _search_pinterest(query)
+    except Exception as e:
+        await ctx.send(f"⚠️ Lỗi khi tìm ảnh trên Pinterest: `{e}`")
+        return
+
+    if not images:
+        await ctx.send(f"❌ Không tìm thấy ảnh nào cho: **{query}**")
+        return
+
+    view = ImagePaginator(query, images, ctx.author.id)
+    message = await ctx.send(embed=view.build_embed(), view=view)
     view.message = message
 
 
