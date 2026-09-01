@@ -1,4 +1,5 @@
 import os
+import time
 import discord
 from discord.ext import commands
 from duckduckgo_search import DDGS
@@ -18,11 +19,20 @@ async def on_ready():
 @bot.command(name="search", help="Tìm kiếm thông tin trên Web")
 async def search_web(ctx, *, query: str):
     await ctx.typing()
-    try:
-        def fetch_results():
-            with DDGS() as ddgs:
-                return list(ddgs.text(query, max_results=3))
 
+    def fetch_results():
+        for attempt in range(3):
+            try:
+                with DDGS(timeout=20) as ddgs:
+                    return list(ddgs.text(query, max_results=3))
+            except Exception as err:
+                if attempt < 2:
+                    time.sleep(2)
+                else:
+                    raise err
+        return []
+
+    try:
         results = await bot.loop.run_in_executor(None, fetch_results)
 
         if not results:
@@ -51,12 +61,22 @@ async def search_web(ctx, *, query: str):
 @bot.command(name="img", help="Tìm kiếm hình ảnh")
 async def search_image(ctx, *, query: str):
     await ctx.typing()
-    try:
-        def fetch_image():
-            with DDGS() as ddgs:
-                results = list(ddgs.images(query, max_results=1))
-                return results[0] if results else None
 
+    def fetch_image():
+        for attempt in range(3):
+            try:
+                with DDGS(timeout=20) as ddgs:
+                    results = list(ddgs.images(query, max_results=1))
+                    if results:
+                        return results[0]
+            except Exception as err:
+                if attempt < 2:
+                    time.sleep(2)
+                else:
+                    raise err
+        return None
+
+    try:
         img_data = await bot.loop.run_in_executor(None, fetch_image)
 
         if not img_data:
@@ -64,7 +84,7 @@ async def search_image(ctx, *, query: str):
             return
 
         embed = discord.Embed(
-            title=f"🖼️ Ảnh cho: {query}",
+            title=f"🖼️ Kết quả hình ảnh: {query}",
             color=discord.Color.green()
         )
         embed.set_image(url=img_data["image"])
@@ -72,7 +92,7 @@ async def search_image(ctx, *, query: str):
         await ctx.send(embed=embed)
 
     except Exception as e:
-        await ctx.send(f"⚠️ Lỗi khi tải ảnh: `{e}`")
+        await ctx.send(f"⚠️ Không thể tải ảnh do kết nối mạng chập chờn: `{e}`")
 
 TOKEN = os.getenv("DISCORD_TOKEN")
 
@@ -80,8 +100,18 @@ if __name__ == "__main__":
     if not TOKEN:
         print("❌ LỖI: Chưa thiết lập biến môi trường DISCORD_TOKEN trên Render!")
     else:
-        # Khởi động HTTP server giữ bot sống trên Web Service
+        # Khởi chạy server Flask ngầm giữ web service sống
         keep_alive()
-        # Chạy bot Discord
-        bot.run(TOKEN)
-      
+
+        # Vòng lặp chống sập khi dính Rate Limit 429 từ Discord
+        while True:
+            try:
+                bot.run(TOKEN)
+                break
+            except discord.errors.HTTPException as e:
+                if e.status == 429:
+                    print("⚠️ Bị Discord Rate Limit 429. Đang chờ 60 giây để thử lại...")
+                    time.sleep(60)
+                else:
+                    raise e
+                    
