@@ -1,2 +1,0 @@
-- name: n
-  run: python crawl_job.py
