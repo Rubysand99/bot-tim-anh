@@ -1,4 +1,4 @@
 discord.py>=2.3.0
-duckduckgo_search>=6.0.0
 Flask>=3.0.0
 gunicorn>=21.2.0
+requests>=2.31.0
