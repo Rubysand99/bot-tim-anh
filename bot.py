@@ -1,8 +1,10 @@
 import os
+import re
+import json
 import time
+import requests
 import discord
 from discord.ext import commands
-from duckduckgo_search import DDGS
 from keep_alive import keep_alive
 
 # Khởi tạo Bot với Prefix "!"
@@ -15,60 +17,60 @@ async def on_ready():
     print(f"Bot đã đăng nhập thành công với tên: {bot.user}")
     print("------------------------------------------")
 
-# Command 1: Tìm kiếm web (!search <từ khóa>)
-@bot.command(name="search", help="Tìm kiếm thông tin trên Web")
-async def search_web(ctx, *, query: str):
-    await ctx.typing()
+# Hàm giả lập trình duyệt tìm ảnh DuckDuckGo qua requests
+def get_duckduckgo_image(query: str):
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+        'Accept-Language': 'en-US,en;q=0.5',
+        'Referer': 'https://duckduckgo.com/'
+    }
 
-    def fetch_results():
-        for attempt in range(3):
-            try:
-                with DDGS(timeout=20) as ddgs:
-                    return list(ddgs.text(query, max_results=3))
-            except Exception as err:
-                if attempt < 2:
-                    time.sleep(2)
-                else:
-                    raise err
-        return []
+    session = requests.Session()
+    session.headers.update(headers)
 
-    try:
-        results = await bot.loop.run_in_executor(None, fetch_results)
+    # Bước 1: Lấy Token VQD từ DuckDuckGo
+    res = session.get("https://duckduckgo.com/", params={'q': query}, timeout=10)
+    vqd_match = re.search(r'vqd=([\d-]+)\&', res.text)
+    if not vqd_match:
+        # Thử regex dự phòng cho định dạng JS
+        vqd_match = re.search(r'vqd=["\']([\d-]+)["\']', res.text)
+    
+    if not vqd_match:
+        raise Exception("Không thể lấy VQD Token từ DuckDuckGo")
 
-        if not results:
-            await ctx.send(f"❌ Không tìm thấy kết quả nào cho: **{query}**")
-            return
+    vqd = vqd_match.group(1)
 
-        embed = discord.Embed(
-            title=f"🔍 Kết quả tìm kiếm: {query}",
-            color=discord.Color.blue()
-        )
-        for idx, item in enumerate(results, 1):
-            title = item.get("title", "Không có tiêu đề")
-            href = item.get("href", "#")
-            body = item.get("body", "Không có mô tả")
-            embed.add_field(
-                name=f"{idx}. {title}",
-                value=f"{body[:150]}...\n🔗 [Xem chi tiết]({href})",
-                inline=False
-            )
-        await ctx.send(embed=embed)
+    # Bước 2: Gọi API tìm ảnh
+    params = {
+        'l': 'wt-wt',
+        'o': 'json',
+        'q': query,
+        'vqd': vqd,
+        'f': ',,,',
+        'p': '1'
+    }
 
-    except Exception as e:
-        await ctx.send(f"⚠️ Có lỗi xảy ra khi tìm kiếm: `{e}`")
+    image_res = session.get("https://duckduckgo.com/i.js", params=params, timeout=10)
+    data = image_res.json()
 
-# Command 2: Tìm kiếm hình ảnh (!img <từ khóa>)
+    results = data.get("results", [])
+    if results:
+        return results[0].get("image")
+    return None
+
+# Command !img
 @bot.command(name="img", help="Tìm kiếm hình ảnh")
 async def search_image(ctx, *, query: str):
     await ctx.typing()
 
-    def fetch_image():
+    def fetch():
+        # Thử lại 3 lần nếu gặp sự cố kết nối
         for attempt in range(3):
             try:
-                with DDGS(timeout=20) as ddgs:
-                    results = list(ddgs.images(query, max_results=1))
-                    if results:
-                        return results[0]
+                img_url = get_duckduckgo_image(query)
+                if img_url:
+                    return img_url
             except Exception as err:
                 if attempt < 2:
                     time.sleep(2)
@@ -77,9 +79,9 @@ async def search_image(ctx, *, query: str):
         return None
 
     try:
-        img_data = await bot.loop.run_in_executor(None, fetch_image)
+        img_url = await bot.loop.run_in_executor(None, fetch)
 
-        if not img_data:
+        if not img_url:
             await ctx.send(f"❌ Không tìm thấy hình ảnh cho: **{query}**")
             return
 
@@ -87,12 +89,12 @@ async def search_image(ctx, *, query: str):
             title=f"🖼️ Kết quả hình ảnh: {query}",
             color=discord.Color.green()
         )
-        embed.set_image(url=img_data["image"])
-        embed.set_footer(text=f"Nguồn: {img_data.get('title', 'DuckDuckGo')}")
+        embed.set_image(url=img_url)
+        embed.set_footer(text="Nguồn: DuckDuckGo via Requests")
         await ctx.send(embed=embed)
 
     except Exception as e:
-        await ctx.send(f"⚠️ Không thể tải ảnh do kết nối mạng chập chờn: `{e}`")
+        await ctx.send(f"⚠️ Lỗi khi tải ảnh: `{e}`")
 
 TOKEN = os.getenv("DISCORD_TOKEN")
 
@@ -100,10 +102,8 @@ if __name__ == "__main__":
     if not TOKEN:
         print("❌ LỖI: Chưa thiết lập biến môi trường DISCORD_TOKEN trên Render!")
     else:
-        # Khởi chạy server Flask ngầm giữ web service sống
         keep_alive()
 
-        # Vòng lặp chống sập khi dính Rate Limit 429 từ Discord
         while True:
             try:
                 bot.run(TOKEN)
