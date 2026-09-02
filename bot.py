@@ -5,6 +5,8 @@ from discord import app_commands
 from discord.ext import commands
 from keep_alive import keep_alive
 from pinterest_crawler import search_pinterest_images_with_retry
+from categories import CATEGORIES
+import db
 
 # Khởi tạo Bot với Prefix "!"
 intents = discord.Intents.default()
@@ -40,30 +42,76 @@ async def ping_prefix(ctx):
 
 
 # ============================================================
-# Lệnh /img và !img (Pinterest) — slash command + prefix + nút chuyển ảnh
+# Lệnh /img và !img — lấy ảnh theo chủ đề từ MongoDB (đã crawl sẵn),
+# tự động fallback cào Pinterest trực tiếp nếu DB hết ảnh khả dụng.
 # ============================================================
 
-class ImagePaginator(discord.ui.View):
-    def __init__(self, query: str, images: list, author_id: int):
+def _category_choices():
+    return [
+        app_commands.Choice(name=info["label"], value=key)
+        for key, info in CATEGORIES.items()
+    ]
+
+
+async def _fetch_next_image_url(category_key: str, exclude_urls: list):
+    """
+    Lấy 1 URL ảnh mới cho category:
+    1) Ưu tiên đọc ảnh đã crawl sẵn trong MongoDB (nhanh, không tốn quota Pinterest).
+    2) Nếu DB hết ảnh khả dụng hoặc lỗi kết nối -> fallback cào trực tiếp Pinterest.
+    Trả về None nếu cả 2 cách đều không có ảnh.
+    """
+    info = CATEGORIES.get(category_key)
+    if not info:
+        return None
+
+    def fetch_db():
+        try:
+            doc = db.get_next_image(category_key, exclude_urls)
+            return doc["image_url"] if doc else None
+        except Exception as e:
+            print(f"⚠️ Lỗi đọc MongoDB, sẽ fallback sang cào trực tiếp: {e}")
+            return None
+
+    url = await bot.loop.run_in_executor(None, fetch_db)
+    if url:
+        return url
+
+    def fetch_crawl():
+        try:
+            results = search_pinterest_images_with_retry(info["keyword"], limit=20, retries=3)
+        except Exception as e:
+            print(f"⚠️ Lỗi fallback cào Pinterest: {e}")
+            return None
+        for u in results:
+            if u not in exclude_urls:
+                return u
+        return None
+
+    return await bot.loop.run_in_executor(None, fetch_crawl)
+
+
+class CategoryImagePaginator(discord.ui.View):
+    def __init__(self, category_key: str, first_url: str, author_id: int):
         super().__init__(timeout=180)
-        self.query = query
-        self.images = images
+        self.category_key = category_key
+        self.label = CATEGORIES[category_key]["label"]
         self.author_id = author_id
+        self.images = [first_url]
         self.index = 0
+        self.message = None
         self._update_buttons()
 
     def _update_buttons(self):
         self.previous_button.disabled = self.index == 0
-        self.next_button.disabled = self.index >= len(self.images) - 1
 
     def build_embed(self) -> discord.Embed:
         embed = discord.Embed(
-            title=f"🖼️ Kết quả tìm ảnh: {self.query}",
+            title=f"🖼️ {self.label}",
             description=f"Ảnh {self.index + 1}/{len(self.images)}",
             color=discord.Color.red(),
         )
         embed.set_image(url=self.images[self.index])
-        embed.set_footer(text="Nguồn: Pinterest")
+        embed.set_footer(text="Nguồn: kho ảnh đã crawl · fallback Pinterest")
         return embed
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
@@ -83,9 +131,26 @@ class ImagePaginator(discord.ui.View):
 
     @discord.ui.button(label="Sau ▶", style=discord.ButtonStyle.secondary)
     async def next_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        # Còn ảnh đã tải sẵn trong bộ nhớ đệm -> chuyển luôn, không cần fetch mới
+        if self.index < len(self.images) - 1:
+            self.index += 1
+            self._update_buttons()
+            await interaction.response.edit_message(embed=self.build_embed(), view=self)
+            return
+
+        # Hết ảnh đệm -> lấy ảnh mới (DB hoặc fallback Pinterest), có thể mất vài giây
+        await interaction.response.defer()
+        new_url = await _fetch_next_image_url(self.category_key, self.images)
+        if not new_url:
+            await interaction.followup.send(
+                "❌ Hết ảnh khả dụng cho chủ đề này rồi, thử lại sau nhé.", ephemeral=True
+            )
+            return
+
+        self.images.append(new_url)
         self.index += 1
         self._update_buttons()
-        await interaction.response.edit_message(embed=self.build_embed(), view=self)
+        await interaction.edit_original_response(embed=self.build_embed(), view=self)
 
     async def on_timeout(self):
         for child in self.children:
@@ -97,48 +162,38 @@ class ImagePaginator(discord.ui.View):
                 pass
 
 
-async def _search_pinterest(query: str):
-    """Chạy crawler Pinterest trong executor để không block event loop."""
-    def fetch():
-        return search_pinterest_images_with_retry(query, limit=20, retries=3)
-    return await bot.loop.run_in_executor(None, fetch)
-
-
-@bot.tree.command(name="img", description="Tìm ảnh trên Pinterest theo từ khóa")
-@app_commands.describe(tu_khoa="Từ khóa cần tìm ảnh")
-async def img_slash(interaction: discord.Interaction, tu_khoa: str):
+@bot.tree.command(name="img", description="Lấy ảnh theo chủ đề (đã crawl sẵn từ Pinterest)")
+@app_commands.describe(chu_de="Chọn chủ đề ảnh")
+@app_commands.choices(chu_de=_category_choices())
+async def img_slash(interaction: discord.Interaction, chu_de: app_commands.Choice[str]):
     await interaction.response.defer()
 
-    try:
-        images = await _search_pinterest(tu_khoa)
-    except Exception as e:
-        await interaction.followup.send(f"⚠️ Lỗi khi tìm ảnh trên Pinterest: `{e}`")
+    url = await _fetch_next_image_url(chu_de.value, [])
+    if not url:
+        await interaction.followup.send(f"❌ Không tìm thấy ảnh nào cho chủ đề: **{chu_de.name}**")
         return
 
-    if not images:
-        await interaction.followup.send(f"❌ Không tìm thấy ảnh nào cho: **{tu_khoa}**")
-        return
-
-    view = ImagePaginator(tu_khoa, images, interaction.user.id)
+    view = CategoryImagePaginator(chu_de.value, url, interaction.user.id)
     message = await interaction.followup.send(embed=view.build_embed(), view=view, wait=True)
     view.message = message
 
 
-@bot.command(name="img", help="Tìm ảnh trên Pinterest theo từ khóa")
-async def img_prefix(ctx, *, query: str):
+@bot.command(name="img", help="Lấy ảnh theo chủ đề. Vd: !img meo")
+async def img_prefix(ctx, chu_de: str = None):
+    if not chu_de or chu_de.lower() not in CATEGORIES:
+        options_text = "\n".join(f"`{k}` — {v['label']}" for k, v in CATEGORIES.items())
+        await ctx.send(f"⚠️ Vui lòng chọn 1 chủ đề hợp lệ:\n{options_text}")
+        return
+
+    category_key = chu_de.lower()
     await ctx.typing()
 
-    try:
-        images = await _search_pinterest(query)
-    except Exception as e:
-        await ctx.send(f"⚠️ Lỗi khi tìm ảnh trên Pinterest: `{e}`")
+    url = await _fetch_next_image_url(category_key, [])
+    if not url:
+        await ctx.send(f"❌ Không tìm thấy ảnh nào cho chủ đề: **{CATEGORIES[category_key]['label']}**")
         return
 
-    if not images:
-        await ctx.send(f"❌ Không tìm thấy ảnh nào cho: **{query}**")
-        return
-
-    view = ImagePaginator(query, images, ctx.author.id)
+    view = CategoryImagePaginator(category_key, url, ctx.author.id)
     message = await ctx.send(embed=view.build_embed(), view=view)
     view.message = message
 
