@@ -7,6 +7,10 @@ on:
   schedule:
     - cron: "0 */6 * * *"  # chạy tự động mỗi 6 tiếng (giờ UTC)
 
+concurrency:
+  group: crawl-job
+  cancel-in-progress: false  # để job đang chạy chạy xong, không huỷ giữa chừng
+
 jobs:
   run-script:
     runs-on: ubuntu-latest
