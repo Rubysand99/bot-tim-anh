@@ -129,12 +129,11 @@ lọc bớt nếu có nhiều hơn 25 category).
 
 ## Deploy
 
-- **Bot**: Render (xem `procfile`). File hiện khai kiểu service **Worker**,
-  còn `keep_alive.py` lại mở 1 server Flask lắng nghe `$PORT` — mục đích
-  thường là để giữ bot thức trên free-tier. **Lưu ý:** 2 khai báo này có thể
-  không khớp nhau tuỳ loại service bạn thực sự chọn khi tạo trên Render
-  (Worker không nhận traffic HTTP, nên `keep_alive` có thể không phát huy tác
-  dụng). Đây là điểm cần rà soát riêng, chưa xử lý trong lần dọn dẹp này.
+- **Bot**: Render, loại **Web Service**. Start Command được set trực tiếp
+  trong Render dashboard (`python3 bot.py`) — **Render không đọc `procfile`**
+  (đã xác nhận thực tế), file này chỉ mang tính tài liệu/tương thích ngược,
+  không ảnh hưởng gì tới runtime. `keep_alive.py` mở server Flask ở `$PORT`
+  để giữ bot thức trên free-tier + phục vụ endpoint `/health`.
 - **Crawl job**: GitHub Actions, tự chạy theo lịch cron trong
   `.github/workflows/main.yml` (mặc định mỗi 6 tiếng), hoặc trigger thủ công
   qua tab Actions (`workflow_dispatch`).
