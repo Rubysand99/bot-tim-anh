@@ -1,3 +1,4 @@
+import logging
 import os
 import random
 import time
@@ -9,6 +10,16 @@ from pinterest_crawler import search_pinterest_images_with_retry
 from categories import CATEGORIES
 import db
 
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+logger = logging.getLogger("bot-tim-anh")
+
+# Giảm bớt log rác từ discord.py (mặc định khá ồn ở mức INFO)
+logging.getLogger("discord").setLevel(logging.WARNING)
+
 # Khởi tạo Bot với Prefix "!"
 intents = discord.Intents.default()
 intents.message_content = True
@@ -17,13 +28,13 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 
 @bot.event
 async def on_ready():
-    print(f"Bot đã đăng nhập thành công với tên: {bot.user}")
+    logger.info(f"Bot đã đăng nhập thành công với tên: {bot.user}")
     try:
         synced = await bot.tree.sync()
-        print(f"Đã đồng bộ {len(synced)} slash command(s).")
+        logger.info(f"Đã đồng bộ {len(synced)} slash command(s).")
     except Exception as e:
-        print(f"⚠️ Lỗi khi đồng bộ slash command: {e}")
-    print("------------------------------------------")
+        logger.warning(f"Lỗi khi đồng bộ slash command: {e}")
+    logger.info("------------------------------------------")
 
 
 # ============================================================
@@ -70,7 +81,7 @@ async def _fetch_next_image_url(category_key: str, exclude_urls: list):
             doc = db.get_next_image(category_key, exclude_urls)
             return doc["image_url"] if doc else None
         except Exception as e:
-            print(f"⚠️ Lỗi đọc MongoDB, sẽ fallback sang cào trực tiếp: {e}")
+            logger.warning(f"Lỗi đọc MongoDB, sẽ fallback sang cào trực tiếp: {e}")
             return None
 
     url = await bot.loop.run_in_executor(None, fetch_db)
@@ -81,7 +92,7 @@ async def _fetch_next_image_url(category_key: str, exclude_urls: list):
         try:
             results = search_pinterest_images_with_retry(info["keyword"], limit=20, retries=3)
         except Exception as e:
-            print(f"⚠️ Lỗi fallback cào Pinterest: {e}")
+            logger.warning(f"Lỗi fallback cào Pinterest: {e}")
             return None
         for u in results:
             if u not in exclude_urls:
@@ -248,7 +259,7 @@ async def _build_stats_embed() -> discord.Embed:
             try:
                 counts[key] = db.count_images(key)
             except Exception as e:
-                print(f"⚠️ Lỗi đếm ảnh category '{key}': {e}")
+                logger.warning(f"Lỗi đếm ảnh category '{key}': {e}")
                 counts[key] = None
         return counts
 
@@ -288,7 +299,7 @@ TOKEN = os.getenv("DISCORD_TOKEN")
 
 if __name__ == "__main__":
     if not TOKEN:
-        print("❌ LỖI: Chưa thiết lập biến môi trường DISCORD_TOKEN trên Render!")
+        logger.error("Chưa thiết lập biến môi trường DISCORD_TOKEN trên Render!")
     else:
         keep_alive()
 
@@ -298,7 +309,7 @@ if __name__ == "__main__":
                 break
             except discord.errors.HTTPException as e:
                 if e.status == 429:
-                    print("⚠️ Bị Discord Rate Limit 429. Đang chờ 60 giây để thử lại...")
+                    logger.warning("Bị Discord Rate Limit 429. Đang chờ 60 giây để thử lại...")
                     time.sleep(60)
                 else:
                     raise e
