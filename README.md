@@ -6,11 +6,11 @@ lưu vào MongoDB, có fallback cào trực tiếp khi DB hết ảnh khả dụ
 ## Kiến trúc
 
 ```
-┌─────────────────┐   cron mỗi 6h    ┌──────────────┐
+┌─────────────────┐   cron mỗi 2h    ┌──────────────┐
 │  GitHub Actions  │ ───────────────▶ │   MongoDB    │
 │  (crawl_job.py)  │   crawl & lưu    │  (Atlas)     │
 └─────────────────┘                  └──────┬───────┘
-                                             │ đọc trước
+                                             │ đọc random
                                              ▼
                                       ┌──────────────┐      hết ảnh khả dụng
                                       │   bot.py     │ ────────────────────▶ cào trực
@@ -22,15 +22,18 @@ lưu vào MongoDB, có fallback cào trực tiếp khi DB hết ảnh khả dụ
   cào ảnh Pinterest theo từng category (tĩnh trong `categories.py` + category
   admin thêm qua Discord), lưu vào MongoDB (bỏ qua ảnh trùng URL nhờ unique
   index). Gửi cảnh báo qua Discord webhook nếu toàn bộ category lỗi hoặc có
-  category sắp cạn ảnh.
+  category sắp cạn ảnh. Ghi lại thời điểm crawl gần nhất để `bot.py` biết khi
+  nào nên tự crawl ngay 1 category mới thêm thay vì chờ chu kỳ tiếp theo.
 - **`bot.py`** — bot Discord, deploy trên Render (xem `procfile`). Lệnh `/img`
-  và `!img` đọc ảnh từ MongoDB trước (nhanh, không phụ thuộc mạng ngoài mỗi lần
-  bấm), chỉ fallback cào Pinterest trực tiếp khi category đó hết ảnh khả dụng
-  trong DB. Có cooldown, giới hạn kênh/role (tuỳ chọn), và lệnh quản trị dành
-  riêng cho admin.
+  lấy ảnh NGẪU NHIÊN trong category đã chọn từ MongoDB (không theo thứ tự),
+  chỉ fallback cào Pinterest trực tiếp khi category đó hết ảnh khả dụng
+  trong DB. Nút Trước/Sau trong embed hoạt động vĩnh viễn (không hết hạn, kể
+  cả sau khi bot restart) vì trạng thái được lưu trong MongoDB thay vì RAM.
+  Có cooldown, giới hạn kênh/role (tuỳ chọn), và lệnh quản trị dành riêng
+  cho admin.
 - **`db.py`** — kết nối MongoDB dùng chung cho cả `crawl_job.py` và `bot.py`.
-  Có thêm category tuỳ chỉnh (`custom_categories`) để admin thêm chủ đề qua
-  Discord mà không cần sửa code.
+  Có category tuỳ chỉnh (`custom_categories`), phiên xem ảnh bền vững
+  (`paginator_sessions`), metadata thời điểm crawl gần nhất (`meta`).
 - **`pinterest_crawler.py`** — logic cào Pinterest (dùng endpoint nội bộ,
   không chính thức — xem cảnh báo trong docstring của file).
 - **`keep_alive.py`** — mở 1 server Flask nhỏ để giữ bot "thức" trên các nền
@@ -81,11 +84,11 @@ DISCORD_TOKEN="..." MONGO_URI="mongodb+srv://..." python bot.py
 
 | Lệnh | Loại | Mô tả |
 |---|---|---|
-| `/img` | Slash | Chọn chủ đề (autocomplete, gõ để tìm), lấy ảnh (có nút Trước/Sau) |
+| `/img` | Slash | Chọn chủ đề (autocomplete, gõ để tìm), lấy 1 ảnh NGẪU NHIÊN trong chủ đề đó (nút Trước/Sau chuyển ảnh, hoạt động vĩnh viễn) |
 | `!img <chủ_đề>` | Prefix | Vd: `!img meo`. Gõ sai/bỏ trống sẽ liệt kê chủ đề hợp lệ |
-| `/random` | Slash | Lấy ảnh từ 1 chủ đề bất kỳ (random) |
+| `/random` | Slash | Lấy 1 ảnh ngẫu nhiên TRÊN TOÀN BỘ KHO (mọi chủ đề), không thiên vị chủ đề ít ảnh |
 | `!random` | Prefix | Tương tự `/random` |
-| `/stats` | Slash | Xem số ảnh (tổng / khả dụng ngay) trong kho theo từng chủ đề |
+| `/stats` | Slash | Thống kê chi tiết: tổng/khả dụng/TB số lần gửi/ảnh mới nhất mỗi chủ đề + lần crawl gần nhất |
 | `!stats` | Prefix | Tương tự `/stats` |
 | `/ping` | Slash | Xem độ trễ bot |
 | `!ping` | Prefix | Xem độ trễ bot |
@@ -93,12 +96,18 @@ DISCORD_TOKEN="..." MONGO_URI="mongodb+srv://..." python bot.py
 **Cooldown:** người dùng thường bị giới hạn 8 giây/lần cho `/img`, `!img`,
 `/random`, `!random`. Admin (`ADMIN_USER_IDS`) không bị giới hạn này.
 
+**Nút Trước/Sau:** không có hạn dùng — bấm được kể cả sau 1 ngày, 1 tuần,
+hay sau khi bot restart, vì trạng thái phiên xem ảnh được lưu trong MongoDB
+(`paginator_sessions`) thay vì bộ nhớ RAM của tiến trình bot.
+
 ### Lệnh admin (chỉ `ADMIN_USER_IDS`)
 
 | Lệnh | Loại | Mô tả |
 |---|---|---|
-| `/addcategory <slug> <label> <keyword>` | Slash | Thêm chủ đề mới, có hiệu lực ngay (không cần deploy lại) |
+| `/addcategory <slug> <label> <keyword>` | Slash | Thêm chủ đề mới, có hiệu lực ngay. Tự crawl ngay chủ đề này nếu lần crawl định kỳ gần nhất đã ≥ 1 tiếng trước |
 | `!addcategory slug \| Label \| keyword` | Prefix | Tương tự, cú pháp phân cách bằng `\|` vì label/keyword có thể có khoảng trắng |
+| `/editcategory <slug> [label] [keyword]` | Slash | Sửa label/keyword của chủ đề đã thêm qua `/addcategory` (bỏ trống phần nào để giữ nguyên) |
+| `!editcategory slug \| Label mới \| keyword mới` | Prefix | Tương tự, để trống phần nào (giữa 2 dấu `\|`) để giữ nguyên |
 | `/removecategory <slug>` | Slash | Xoá chủ đề đã thêm qua `/addcategory` (không xoá được category tĩnh trong `categories.py`) |
 | `!removecategory <slug>` | Prefix | Tương tự |
 | `/cleanup <chủ_đề>` | Slash | Dọn ảnh lỗi link (404...) và ảnh đã gửi ≥ 20 lần trong 1 chủ đề |
@@ -108,10 +117,14 @@ DISCORD_TOKEN="..." MONGO_URI="mongodb+srv://..." python bot.py
 
 2 cách:
 1. **Qua Discord (khuyên dùng, không cần deploy lại):** admin dùng
-   `/addcategory` hoặc `!addcategory`. Lưu trong MongoDB (`custom_categories`),
-   `crawl_job.py` sẽ tự crawl luôn category này ở lần chạy tiếp theo.
+   `/addcategory` hoặc `!addcategory`. Lưu trong MongoDB (`custom_categories`).
+   Nếu lần crawl định kỳ gần nhất đã ≥ 1 tiếng trước (hoặc chưa từng crawl),
+   bot sẽ **tự crawl ngay** category này để có ảnh dùng luôn, không phải chờ
+   tới chu kỳ crawl tiếp theo (2 tiếng). Dùng `/editcategory` để sửa lại
+   label/keyword sau này nếu cần.
 2. **Sửa code:** sửa trực tiếp dict `CATEGORIES` trong `categories.py` rồi
-   deploy lại. Category kiểu này không xoá được qua `/removecategory`.
+   deploy lại. Category kiểu này không sửa/xoá được qua `/editcategory` hay
+   `/removecategory`.
 
 Lưu ý: Discord autocomplete giới hạn tối đa 25 gợi ý hiển thị cùng lúc (gõ để
 lọc bớt nếu có nhiều hơn 25 category).
@@ -135,5 +148,8 @@ lọc bớt nếu có nhiều hơn 25 category).
   không ảnh hưởng gì tới runtime. `keep_alive.py` mở server Flask ở `$PORT`
   để giữ bot thức trên free-tier + phục vụ endpoint `/health`.
 - **Crawl job**: GitHub Actions, tự chạy theo lịch cron trong
-  `.github/workflows/main.yml` (mặc định mỗi 6 tiếng), hoặc trigger thủ công
-  qua tab Actions (`workflow_dispatch`).
+  `.github/workflows/main.yml` (mặc định mỗi 2 tiếng), hoặc trigger thủ công
+  qua tab Actions (`workflow_dispatch`). Lưu ý: GitHub Actions cron chỉ chạy
+  theo giờ đồng hồ cố định, không hỗ trợ kiểu "2 tiếng sau khi lần trước
+  chạy xong" — do job chạy rất nhanh (15-40 giây) nên chênh lệch giữa 2 cách
+  tính là không đáng kể trong thực tế.

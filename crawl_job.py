@@ -27,7 +27,7 @@ import requests
 from pymongo.errors import DuplicateKeyError
 
 from categories import CATEGORIES
-from db import get_db, COLLECTION_NAME, get_custom_categories, count_available_images
+from db import get_db, COLLECTION_NAME, get_custom_categories, count_available_images, set_last_crawl_time
 from pinterest_crawler import search_pinterest_images_with_retry
 
 logging.basicConfig(
@@ -110,6 +110,11 @@ def main():
             failed_categories.append(slug)
 
     logger.info(f"=== Xong. Tổng: {total_inserted} ảnh mới, {total_skipped} ảnh trùng ===")
+
+    try:
+        set_last_crawl_time()
+    except Exception as e:
+        logger.warning(f"Không ghi được thời điểm crawl gần nhất: {e}")
 
     if failed_categories:
         logger.warning(f"Các category bị lỗi khi crawl: {', '.join(failed_categories)}")
