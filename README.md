@@ -69,6 +69,10 @@ DISCORD_TOKEN="..." MONGO_URI="mongodb+srv://..." python bot.py
 |---|---|---|
 | `/img` | Slash | Chọn chủ đề từ dropdown, lấy ảnh (có nút Trước/Sau) |
 | `!img <chủ_đề>` | Prefix | Vd: `!img meo`. Gõ sai/bỏ trống sẽ liệt kê chủ đề hợp lệ |
+| `/random` | Slash | Lấy ảnh từ 1 chủ đề bất kỳ (random) |
+| `!random` | Prefix | Tương tự `/random` |
+| `/stats` | Slash | Xem số ảnh còn lại trong kho (MongoDB) theo từng chủ đề |
+| `!stats` | Prefix | Tương tự `/stats` |
 | `/ping` | Slash | Xem độ trễ bot |
 | `!ping` | Prefix | Xem độ trễ bot |
 

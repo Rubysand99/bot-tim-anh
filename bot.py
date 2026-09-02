@@ -1,4 +1,5 @@
 import os
+import random
 import time
 import discord
 from discord import app_commands
@@ -196,6 +197,91 @@ async def img_prefix(ctx, chu_de: str = None):
     view = CategoryImagePaginator(category_key, url, ctx.author.id)
     message = await ctx.send(embed=view.build_embed(), view=view)
     view.message = message
+
+
+# ============================================================
+# Lệnh /random và !random — chọn ngẫu nhiên 1 chủ đề rồi lấy ảnh
+# ============================================================
+
+@bot.tree.command(name="random", description="Lấy ảnh từ một chủ đề bất kỳ (ngẫu nhiên)")
+async def random_slash(interaction: discord.Interaction):
+    await interaction.response.defer()
+
+    category_key = random.choice(list(CATEGORIES.keys()))
+    url = await _fetch_next_image_url(category_key, [])
+    if not url:
+        await interaction.followup.send(
+            f"❌ Không tìm thấy ảnh nào cho chủ đề ngẫu nhiên: **{CATEGORIES[category_key]['label']}**"
+        )
+        return
+
+    view = CategoryImagePaginator(category_key, url, interaction.user.id)
+    message = await interaction.followup.send(embed=view.build_embed(), view=view, wait=True)
+    view.message = message
+
+
+@bot.command(name="random", help="Lấy ảnh từ một chủ đề bất kỳ (ngẫu nhiên)")
+async def random_prefix(ctx):
+    await ctx.typing()
+
+    category_key = random.choice(list(CATEGORIES.keys()))
+    url = await _fetch_next_image_url(category_key, [])
+    if not url:
+        await ctx.send(
+            f"❌ Không tìm thấy ảnh nào cho chủ đề ngẫu nhiên: **{CATEGORIES[category_key]['label']}**"
+        )
+        return
+
+    view = CategoryImagePaginator(category_key, url, ctx.author.id)
+    message = await ctx.send(embed=view.build_embed(), view=view)
+    view.message = message
+
+
+# ============================================================
+# Lệnh /stats và !stats — đếm số ảnh còn trong kho (MongoDB) theo chủ đề
+# ============================================================
+
+async def _build_stats_embed() -> discord.Embed:
+    def fetch_counts():
+        counts = {}
+        for key in CATEGORIES:
+            try:
+                counts[key] = db.count_images(key)
+            except Exception as e:
+                print(f"⚠️ Lỗi đếm ảnh category '{key}': {e}")
+                counts[key] = None
+        return counts
+
+    counts = await bot.loop.run_in_executor(None, fetch_counts)
+
+    embed = discord.Embed(
+        title="📊 Kho ảnh theo chủ đề",
+        color=discord.Color.blurple(),
+    )
+    total = 0
+    for key, info in CATEGORIES.items():
+        n = counts.get(key)
+        if n is None:
+            embed.add_field(name=info["label"], value="⚠️ lỗi đọc DB", inline=True)
+        else:
+            embed.add_field(name=info["label"], value=f"{n} ảnh", inline=True)
+            total += n
+    embed.set_footer(text=f"Tổng cộng: {total} ảnh trong kho")
+    return embed
+
+
+@bot.tree.command(name="stats", description="Xem số lượng ảnh còn trong kho theo từng chủ đề")
+async def stats_slash(interaction: discord.Interaction):
+    await interaction.response.defer()
+    embed = await _build_stats_embed()
+    await interaction.followup.send(embed=embed)
+
+
+@bot.command(name="stats", help="Xem số lượng ảnh còn trong kho theo từng chủ đề")
+async def stats_prefix(ctx):
+    await ctx.typing()
+    embed = await _build_stats_embed()
+    await ctx.send(embed=embed)
 
 
 TOKEN = os.getenv("DISCORD_TOKEN")
