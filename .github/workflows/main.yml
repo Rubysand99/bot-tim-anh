@@ -30,4 +30,5 @@ jobs:
       - name: Run script
         env:
           MONGO_URI: ${{ secrets.MONGO_URI }}
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
         run: python crawl_job.py

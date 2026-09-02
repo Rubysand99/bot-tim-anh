@@ -1,25 +1,33 @@
 """
 crawl_job.py
 Chạy định kỳ (qua GitHub Actions cron, xem .github/workflows/main.yml) để
-crawl ảnh Pinterest theo từng category trong categories.py, lưu vào MongoDB.
+crawl ảnh Pinterest theo từng category (categories.py + category admin thêm
+qua Discord, lưu trong MongoDB), lưu vào MongoDB.
 
 Bot (bot.py) ưu tiên đọc ảnh đã crawl sẵn ở đây trước, chỉ cào Pinterest
 trực tiếp khi DB hết ảnh khả dụng cho category đó (xem hàm
 _fetch_next_image_url trong bot.py) — giúp giảm hẳn tần suất gọi Pinterest
 trực tiếp và rủi ro bị chặn IP của Render.
 
+Biến môi trường tuỳ chọn:
+    DISCORD_WEBHOOK_URL - nếu set, job sẽ gửi cảnh báo qua webhook này khi:
+        - toàn bộ category đều crawl lỗi
+        - có category sắp cạn ảnh khả dụng (dưới LOW_STOCK_THRESHOLD)
+
 Chạy thủ công (test local qua Termux):
     MONGO_URI="mongodb+srv://..." python crawl_job.py
 """
 
 import logging
+import os
 import sys
 from datetime import datetime, timezone
 
+import requests
 from pymongo.errors import DuplicateKeyError
 
 from categories import CATEGORIES
-from db import get_db, COLLECTION_NAME
+from db import get_db, COLLECTION_NAME, get_custom_categories, count_available_images
 from pinterest_crawler import search_pinterest_images_with_retry
 
 logging.basicConfig(
@@ -30,6 +38,29 @@ logging.basicConfig(
 logger = logging.getLogger("crawl_job")
 
 IMAGES_PER_CATEGORY = 30  # số ảnh tối đa lấy về mỗi lần crawl / category
+LOW_STOCK_THRESHOLD = 5   # cảnh báo nếu 1 category còn dưới ngần này ảnh khả dụng
+
+
+def send_discord_alert(message: str) -> None:
+    """Gửi cảnh báo qua Discord webhook (nếu đã cấu hình DISCORD_WEBHOOK_URL)."""
+    webhook_url = os.getenv("DISCORD_WEBHOOK_URL")
+    if not webhook_url:
+        logger.info("DISCORD_WEBHOOK_URL chưa được set, bỏ qua gửi cảnh báo.")
+        return
+    try:
+        requests.post(webhook_url, json={"content": message}, timeout=10)
+    except Exception as e:
+        logger.warning(f"Gửi cảnh báo Discord webhook thất bại: {e}")
+
+
+def get_all_categories() -> dict:
+    """Gộp category tĩnh (categories.py) + category admin thêm qua Discord (MongoDB)."""
+    merged = dict(CATEGORIES)
+    try:
+        merged.update(get_custom_categories())
+    except Exception as e:
+        logger.warning(f"Không đọc được custom categories từ DB: {e}")
+    return merged
 
 
 def crawl_category(slug: str, keyword: str):
@@ -63,11 +94,13 @@ def crawl_category(slug: str, keyword: str):
 
 def main():
     logger.info(f"=== Bắt đầu crawl lúc {datetime.now(timezone.utc).isoformat()} ===")
+    all_categories = get_all_categories()
+
     total_inserted = 0
     total_skipped = 0
     failed_categories = []
 
-    for slug, info in CATEGORIES.items():
+    for slug, info in all_categories.items():
         logger.info(f"→ Crawl category: {info['label']} (keyword: {info['keyword']})")
         inserted, skipped, had_error = crawl_category(slug, info["keyword"])
         logger.info(f"  + {inserted} ảnh mới, {skipped} ảnh trùng (đã có sẵn)")
@@ -84,10 +117,32 @@ def main():
     # Nếu TOÀN BỘ category đều lỗi (thường do Pinterest chặn IP runner) thì
     # coi đây là job thất bại thay vì âm thầm "thành công" với 0 ảnh mới —
     # để GitHub Actions báo đỏ, bạn dễ nhận ra ngay thay vì phát hiện muộn.
-    if len(failed_categories) == len(CATEGORIES):
+    if failed_categories and len(failed_categories) == len(all_categories):
+        send_discord_alert(
+            "🔴 **crawl_job thất bại toàn bộ** — tất cả category đều crawl lỗi, "
+            "có thể Pinterest đang chặn IP của GitHub Actions runner."
+        )
         raise RuntimeError(
             "Tất cả category đều crawl lỗi — có thể Pinterest đang chặn IP của GitHub Actions runner."
         )
+
+    # Cảnh báo category sắp cạn ảnh khả dụng (không tính là lỗi job)
+    low_stock = []
+    for slug, info in all_categories.items():
+        if slug in failed_categories:
+            continue
+        try:
+            available = count_available_images(slug)
+        except Exception as e:
+            logger.warning(f"Không đếm được ảnh khả dụng cho '{slug}': {e}")
+            continue
+        if available < LOW_STOCK_THRESHOLD:
+            low_stock.append(f"- {info['label']} (`{slug}`): còn {available} ảnh khả dụng")
+
+    if low_stock:
+        alert_lines = "\n".join(low_stock)
+        logger.warning(f"Các category sắp cạn ảnh:\n{alert_lines}")
+        send_discord_alert(f"🟡 **Cảnh báo: sắp cạn ảnh khả dụng**\n{alert_lines}")
 
 
 if __name__ == "__main__":
