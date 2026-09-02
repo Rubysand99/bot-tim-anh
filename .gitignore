@@ -1,0 +1,21 @@
+# Byte-compiled / cache
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# Biến môi trường / secrets (KHÔNG bao giờ commit)
+.env
+.env.*
+
+# Log
+*.log
+
+# OS / editor
+.DS_Store
+.vscode/
+.idea/

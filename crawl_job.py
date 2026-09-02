@@ -1,9 +1,12 @@
 """
 crawl_job.py
-Chạy định kỳ (qua GitHub Actions cron) để crawl ảnh Pinterest theo từng
-category trong categories.py, lưu vào MongoDB. Bot KHÔNG gọi Pinterest
-trực tiếp nữa — chỉ đọc dữ liệu đã crawl sẵn từ MongoDB, giúp giảm hẳn
-rủi ro bị Pinterest chặn IP của Render.
+Chạy định kỳ (qua GitHub Actions cron, xem .github/workflows/main.yml) để
+crawl ảnh Pinterest theo từng category trong categories.py, lưu vào MongoDB.
+
+Bot (bot.py) ưu tiên đọc ảnh đã crawl sẵn ở đây trước, chỉ cào Pinterest
+trực tiếp khi DB hết ảnh khả dụng cho category đó (xem hàm
+_fetch_next_image_url trong bot.py) — giúp giảm hẳn tần suất gọi Pinterest
+trực tiếp và rủi ro bị chặn IP của Render.
 
 Chạy thủ công (test local qua Termux):
     MONGO_URI="mongodb+srv://..." python crawl_job.py
