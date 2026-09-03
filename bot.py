@@ -1,3 +1,4 @@
+import asyncio
 import concurrent.futures
 import logging
 import os
@@ -8,7 +9,7 @@ from datetime import datetime, timezone, timedelta
 import discord
 import requests
 from discord import app_commands
-from discord.ext import commands
+from discord.ext import commands, tasks
 from keep_alive import keep_alive
 from pinterest_crawler import search_pinterest_images_with_retry
 from categories import CATEGORIES
@@ -29,6 +30,60 @@ logging.getLogger("discord").setLevel(logging.WARNING)
 def _parse_id_set(env_name: str) -> set:
     raw = os.getenv(env_name, "")
     return {int(x) for x in raw.split(",") if x.strip().isdigit()}
+
+
+# ============================================================
+# Kênh log Discord — mọi log ở mức WARNING/ERROR trong bot (lỗi crawl, lỗi
+# DB, tác vụ không thực hiện được...) sẽ tự động được gửi vào kênh này,
+# ngoài việc vẫn in ra log thường (Render logs) như trước. Bỏ trống
+# LOG_CHANNEL_ID = tắt tính năng này, chỉ log ra Render như cũ.
+# ============================================================
+
+_log_channel_raw = os.getenv("LOG_CHANNEL_ID", "").strip()
+LOG_CHANNEL_ID = int(_log_channel_raw) if _log_channel_raw.isdigit() else None
+
+
+async def _send_log_channel_message(content: str = None, embed: discord.Embed = None):
+    if not LOG_CHANNEL_ID:
+        return None
+    channel = bot.get_channel(LOG_CHANNEL_ID)
+    if channel is None:
+        try:
+            channel = await bot.fetch_channel(LOG_CHANNEL_ID)
+        except Exception:
+            return None
+    try:
+        return await channel.send(content=content, embed=embed)
+    except Exception:
+        return None
+
+
+class DiscordAlertHandler(logging.Handler):
+    """
+    logging.Handler tự động chuyển tiếp mọi log WARNING/ERROR sang kênh
+    Discord (LOG_CHANNEL_ID), không cần sửa từng chỗ logger.warning() rải
+    rác trong code. Chạy an toàn dù được gọi từ thread khác (executor) nhờ
+    asyncio.run_coroutine_threadsafe.
+    """
+
+    def __init__(self, level=logging.WARNING):
+        super().__init__(level)
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            if not LOG_CHANNEL_ID:
+                return
+            loop = getattr(bot, "loop", None)
+            if loop is None or not loop.is_running():
+                return
+            msg = self.format(record)
+            if len(msg) > 1900:
+                msg = msg[:1900] + "…"
+            icon = "🔴" if record.levelno >= logging.ERROR else "🟡"
+            content = f"{icon} `{record.name}` {msg}"
+            asyncio.run_coroutine_threadsafe(_send_log_channel_message(content=content), loop)
+        except Exception:
+            pass  # logging handler không bao giờ được phép raise lỗi ra ngoài
 
 
 # ============================================================
@@ -106,7 +161,69 @@ intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
+# Gắn handler để log WARNING/ERROR tự động chuyển tiếp sang kênh Discord
+# (bot phải được tạo trước vì handler tham chiếu tới biến `bot`).
+_discord_alert_handler = DiscordAlertHandler()
+logger.addHandler(_discord_alert_handler)
+crawl_job.logger.addHandler(_discord_alert_handler)
+
 _persistent_view_ready = False
+_last_ping_message_id = None
+
+
+# ============================================================
+# Heartbeat ping — gửi ngay lúc bot khởi động, sau đó lặp lại mỗi 10 phút,
+# vào kênh LOG_CHANNEL_ID. Xoá tin ping CŨ trước khi gửi ping MỚI để tránh
+# làm trôi các tin nhắn khác trong kênh log (chỉ giữ 1 tin ping mới nhất).
+# ============================================================
+
+def _format_latency_ms():
+    """bot.latency có thể là NaN nếu chưa có phép đo heartbeat websocket nào."""
+    latency = bot.latency
+    if latency != latency:  # NaN != NaN, cách kiểm tra NaN không cần import math
+        return "N/A"
+    return f"{round(latency * 1000)}ms"
+
+
+@tasks.loop(minutes=10)
+async def heartbeat_ping():
+    global _last_ping_message_id
+    if not LOG_CHANNEL_ID:
+        return
+
+    channel = bot.get_channel(LOG_CHANNEL_ID)
+    if channel is None:
+        try:
+            channel = await bot.fetch_channel(LOG_CHANNEL_ID)
+        except Exception as e:
+            logger.warning(f"Không lấy được kênh log (LOG_CHANNEL_ID={LOG_CHANNEL_ID}): {e}")
+            return
+
+    if _last_ping_message_id:
+        try:
+            old_msg = await channel.fetch_message(_last_ping_message_id)
+            await old_msg.delete()
+        except discord.NotFound:
+            pass  # tin cũ đã bị xoá thủ công từ trước, bỏ qua
+        except Exception as e:
+            logger.warning(f"Không xoá được tin ping cũ: {e}")
+
+    embed = discord.Embed(
+        title="✅ Bot đang hoạt động",
+        description=f"Độ trễ hiện tại: **{_format_latency_ms()}**",
+        color=discord.Color.green(),
+        timestamp=datetime.now(timezone.utc),
+    )
+    try:
+        msg = await channel.send(embed=embed)
+        _last_ping_message_id = msg.id
+    except Exception as e:
+        logger.warning(f"Không gửi được heartbeat ping vào kênh log: {e}")
+
+
+@heartbeat_ping.before_loop
+async def _before_heartbeat_ping():
+    await bot.wait_until_ready()
 
 
 @bot.event
@@ -120,8 +237,12 @@ async def on_ready():
         logger.warning(f"Lỗi khi đồng bộ slash command: {e}")
     if not _persistent_view_ready:
         bot.add_view(PAGINATOR_VIEW)
+        bot.add_view(EPHEMERAL_PAGINATOR_VIEW)
+        bot.add_view(SHOWCASE_VIEW)
         _persistent_view_ready = True
-        logger.info("Đã đăng ký persistent view cho nút chuyển ảnh (hoạt động cả sau khi bot restart).")
+        logger.info("Đã đăng ký các persistent view (nút ảnh + showcase) — hoạt động cả sau khi bot restart.")
+    if not heartbeat_ping.is_running():
+        heartbeat_ping.start()  # tự gửi ping ngay lần đầu, sau đó lặp lại mỗi 10 phút
     logger.info("------------------------------------------")
 
 
@@ -131,23 +252,35 @@ async def on_ready():
 
 @bot.tree.command(name="ping", description="Kiểm tra độ trễ của bot")
 async def ping_slash(interaction: discord.Interaction):
-    latency_ms = round(bot.latency * 1000)
-    await interaction.response.send_message(f"🏓 Pong! Độ trễ: **{latency_ms}ms**")
+    await interaction.response.send_message(f"🏓 Pong! Độ trễ: **{_format_latency_ms()}**")
 
 
 @bot.command(name="ping", help="Kiểm tra độ trễ của bot")
 async def ping_prefix(ctx):
-    latency_ms = round(bot.latency * 1000)
-    await ctx.send(f"🏓 Pong! Độ trễ: **{latency_ms}ms**")
+    await ctx.send(f"🏓 Pong! Độ trễ: **{_format_latency_ms()}**")
 
 
 # ============================================================
 # Chủ đề (category): gộp CATEGORIES tĩnh (categories.py) với category
-# admin thêm qua Discord (lưu trong MongoDB) — luôn đọc mới mỗi lần dùng
-# để /addcategory có hiệu lực ngay, không cần restart bot.
+# admin thêm qua Discord (lưu trong MongoDB) — cache 30 giây để tránh mỗi
+# lần dùng lệnh (kể cả mỗi ký tự gõ trong autocomplete) đều phải round-trip
+# MongoDB. /addcategory, /editcategory, /removecategory chủ động xoá cache
+# ngay sau khi sửa nên vẫn có hiệu lực tức thì, không phải đợi 30 giây.
 # ============================================================
 
+_categories_cache = {"data": None, "at": 0.0}
+CATEGORIES_CACHE_TTL_SECONDS = 30
+
+
+def _invalidate_categories_cache() -> None:
+    _categories_cache["at"] = 0.0
+
+
 async def get_all_categories_async() -> dict:
+    now = time.monotonic()
+    if _categories_cache["data"] is not None and (now - _categories_cache["at"]) < CATEGORIES_CACHE_TTL_SECONDS:
+        return _categories_cache["data"]
+
     def fetch():
         merged = dict(CATEGORIES)
         try:
@@ -155,7 +288,11 @@ async def get_all_categories_async() -> dict:
         except Exception as e:
             logger.warning(f"Không đọc được custom categories từ DB: {e}")
         return merged
-    return await bot.loop.run_in_executor(None, fetch)
+
+    result = await bot.loop.run_in_executor(None, fetch)
+    _categories_cache["data"] = result
+    _categories_cache["at"] = now
+    return result
 
 
 async def category_autocomplete(interaction: discord.Interaction, current: str):
@@ -171,8 +308,14 @@ async def category_autocomplete(interaction: discord.Interaction, current: str):
 
 # ============================================================
 # Lấy ảnh: ưu tiên MongoDB (random trong category, không theo thứ tự),
-# fallback cào Pinterest trực tiếp nếu DB hết ảnh khả dụng.
+# fallback cào Pinterest trực tiếp nếu DB hết ảnh khả dụng. Có đo thời gian
+# và cảnh báo (-> kênh log nếu bật) khi 1 bước chậm bất thường, để dễ chẩn
+# đoán chỗ nào đang làm bot phản hồi chậm.
 # ============================================================
+
+SLOW_DB_THRESHOLD_SECONDS = 3
+SLOW_CRAWL_THRESHOLD_SECONDS = 15
+
 
 async def _fetch_next_image_url(category_key: str, keyword: str, exclude_urls: list):
     def fetch_db():
@@ -183,7 +326,14 @@ async def _fetch_next_image_url(category_key: str, keyword: str, exclude_urls: l
             logger.warning(f"Lỗi đọc MongoDB, sẽ fallback sang cào trực tiếp: {e}")
             return None
 
+    t0 = time.monotonic()
     url = await bot.loop.run_in_executor(None, fetch_db)
+    db_elapsed = time.monotonic() - t0
+    if db_elapsed > SLOW_DB_THRESHOLD_SECONDS:
+        logger.warning(f"Đọc MongoDB cho '{category_key}' chậm bất thường: {db_elapsed:.1f}s")
+    else:
+        logger.info(f"[perf] Đọc MongoDB cho '{category_key}': {db_elapsed:.2f}s")
+
     if url:
         return url
 
@@ -198,7 +348,38 @@ async def _fetch_next_image_url(category_key: str, keyword: str, exclude_urls: l
                 return u
         return None
 
-    return await bot.loop.run_in_executor(None, fetch_crawl)
+    t1 = time.monotonic()
+    url = await bot.loop.run_in_executor(None, fetch_crawl)
+    crawl_elapsed = time.monotonic() - t1
+    if crawl_elapsed > SLOW_CRAWL_THRESHOLD_SECONDS:
+        logger.warning(f"Fallback cào Pinterest cho '{category_key}' chậm bất thường: {crawl_elapsed:.1f}s")
+    else:
+        logger.info(f"[perf] Fallback cào Pinterest cho '{category_key}': {crawl_elapsed:.2f}s")
+
+    return url
+
+
+
+def _try_get_image_info(url: str):
+    """
+    Lấy nhanh định dạng + dung lượng ảnh qua HEAD request (không tải cả ảnh).
+    Trả về chuỗi mô tả, hoặc None nếu không lấy được (không coi là lỗi —
+    chỗ gọi hàm này sẽ tự dùng ghi chú thường nếu trả về None).
+    """
+    try:
+        resp = requests.head(url, timeout=4, allow_redirects=True)
+        content_type = resp.headers.get("Content-Type", "")
+        content_length = resp.headers.get("Content-Length")
+
+        parts = []
+        if content_type:
+            parts.append(content_type)
+        if content_length and content_length.isdigit():
+            size_kb = int(content_length) / 1024
+            parts.append(f"{size_kb / 1024:.1f} MB" if size_kb >= 1024 else f"{size_kb:.0f} KB")
+        return " · ".join(parts) if parts else None
+    except Exception:
+        return None
 
 
 def _build_image_embed(label: str, url: str) -> discord.Embed:
@@ -221,6 +402,63 @@ async def _send_image_result(send_func, category_key: str, label: str, keyword: 
     )
 
 
+async def _paginator_navigate(interaction: discord.Interaction, direction: int, view: discord.ui.View):
+    """
+    Logic điều hướng dùng chung cho cả PersistentImagePaginator (nút Trước/Sau
+    công khai của /img, /random) và EphemeralImagePaginator (phiên xem riêng
+    tư sau khi bấm "Bắt đầu" ở showcase board).
+    """
+    message_id = str(interaction.message.id)
+    session = await bot.loop.run_in_executor(None, db.get_paginator_session, message_id)
+
+    if not session:
+        await interaction.response.send_message(
+            "⚠️ Không tìm thấy dữ liệu phiên xem ảnh này nữa. Dùng lại `/img` để bắt đầu phiên mới.",
+            ephemeral=True,
+        )
+        return
+    if interaction.user.id != session["author_id"]:
+        await interaction.response.send_message(
+            "⚠️ Bạn không thể điều khiển kết quả tìm kiếm của người khác.", ephemeral=True
+        )
+        return
+
+    images = session["images"]
+    index = session["index"]
+
+    if direction < 0:
+        index = max(0, index - 1)
+        await bot.loop.run_in_executor(None, db.update_paginator_session, message_id, images, index)
+        await interaction.response.edit_message(embed=_build_image_embed(session["label"], images[index]), view=view)
+        return
+
+    # direction > 0 ("Sau"): còn ảnh đệm sẵn -> chuyển luôn
+    if index < len(images) - 1:
+        index += 1
+        await bot.loop.run_in_executor(None, db.update_paginator_session, message_id, images, index)
+        await interaction.response.edit_message(embed=_build_image_embed(session["label"], images[index]), view=view)
+        return
+
+    # Danh sách hữu hạn (vd: favorites, keyword rỗng) -> không có gì để fetch thêm
+    if not session.get("keyword"):
+        await interaction.response.send_message("📭 Đã hết ảnh trong danh sách này.", ephemeral=True)
+        return
+
+    # Hết ảnh đệm -> lấy ảnh mới (DB hoặc fallback Pinterest), có thể mất vài giây
+    await interaction.response.defer()
+    new_url = await _fetch_next_image_url(session["category_key"], session["keyword"], images)
+    if not new_url:
+        await interaction.followup.send(
+            "❌ Hết ảnh khả dụng cho chủ đề này rồi, thử lại sau nhé.", ephemeral=True
+        )
+        return
+
+    images.append(new_url)
+    index += 1
+    await bot.loop.run_in_executor(None, db.update_paginator_session, message_id, images, index)
+    await interaction.edit_original_response(embed=_build_image_embed(session["label"], images[index]), view=view)
+
+
 class PersistentImagePaginator(discord.ui.View):
     """
     View "vĩnh viễn": không timeout, đăng ký 1 lần lúc bot khởi động qua
@@ -234,60 +472,177 @@ class PersistentImagePaginator(discord.ui.View):
 
     @discord.ui.button(label="◀ Trước", style=discord.ButtonStyle.secondary, custom_id="paginator:prev")
     async def previous_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await self._navigate(interaction, -1)
+        await _paginator_navigate(interaction, -1, self)
 
     @discord.ui.button(label="Sau ▶", style=discord.ButtonStyle.secondary, custom_id="paginator:next")
     async def next_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await self._navigate(interaction, +1)
-
-    async def _navigate(self, interaction: discord.Interaction, direction: int):
-        message_id = str(interaction.message.id)
-        session = await bot.loop.run_in_executor(None, db.get_paginator_session, message_id)
-
-        if not session:
-            await interaction.response.send_message(
-                "⚠️ Không tìm thấy dữ liệu phiên xem ảnh này nữa. Dùng lại `/img` để bắt đầu phiên mới.",
-                ephemeral=True,
-            )
-            return
-        if interaction.user.id != session["author_id"]:
-            await interaction.response.send_message(
-                "⚠️ Bạn không thể điều khiển kết quả tìm kiếm của người khác.", ephemeral=True
-            )
-            return
-
-        images = session["images"]
-        index = session["index"]
-
-        if direction < 0:
-            index = max(0, index - 1)
-            await bot.loop.run_in_executor(None, db.update_paginator_session, message_id, images, index)
-            await interaction.response.edit_message(embed=_build_image_embed(session["label"], images[index]), view=self)
-            return
-
-        # direction > 0 ("Sau"): còn ảnh đệm sẵn -> chuyển luôn
-        if index < len(images) - 1:
-            index += 1
-            await bot.loop.run_in_executor(None, db.update_paginator_session, message_id, images, index)
-            await interaction.response.edit_message(embed=_build_image_embed(session["label"], images[index]), view=self)
-            return
-
-        # Hết ảnh đệm -> lấy ảnh mới (DB hoặc fallback Pinterest), có thể mất vài giây
-        await interaction.response.defer()
-        new_url = await _fetch_next_image_url(session["category_key"], session["keyword"], images)
-        if not new_url:
-            await interaction.followup.send(
-                "❌ Hết ảnh khả dụng cho chủ đề này rồi, thử lại sau nhé.", ephemeral=True
-            )
-            return
-
-        images.append(new_url)
-        index += 1
-        await bot.loop.run_in_executor(None, db.update_paginator_session, message_id, images, index)
-        await interaction.edit_original_response(embed=_build_image_embed(session["label"], images[index]), view=self)
+        await _paginator_navigate(interaction, +1, self)
 
 
 PAGINATOR_VIEW = PersistentImagePaginator()
+
+
+class EphemeralImagePaginator(discord.ui.View):
+    """
+    Giống PersistentImagePaginator nhưng có thêm nút "💾 Lưu ảnh" — dùng cho
+    phiên xem riêng tư (ephemeral) mở ra sau khi bấm "Bắt đầu" ở showcase
+    board, hoặc khi xem lại /favorites. custom_id khác PAGINATOR_VIEW để
+    Discord phân biệt được 2 view khi cùng đăng ký persistent.
+    """
+
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="◀", style=discord.ButtonStyle.secondary, custom_id="epaginator:prev")
+    async def previous_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await _paginator_navigate(interaction, -1, self)
+
+    @discord.ui.button(label="▶", style=discord.ButtonStyle.secondary, custom_id="epaginator:next")
+    async def next_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await _paginator_navigate(interaction, +1, self)
+
+    @discord.ui.button(label="💾 Lưu ảnh", style=discord.ButtonStyle.success, custom_id="epaginator:save")
+    async def save_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        message_id = str(interaction.message.id)
+        session = await bot.loop.run_in_executor(None, db.get_paginator_session, message_id)
+        if not session:
+            await interaction.response.send_message("⚠️ Không tìm thấy dữ liệu ảnh này nữa.", ephemeral=True)
+            return
+        if interaction.user.id != session["author_id"]:
+            await interaction.response.send_message("⚠️ Bạn không thể lưu ảnh của người khác.", ephemeral=True)
+            return
+
+        url = session["images"][session["index"]]
+        label = session["label"]
+        await interaction.response.defer(ephemeral=True)
+
+        saved = await bot.loop.run_in_executor(
+            None, db.add_favorite, interaction.user.id, session["category_key"], url
+        )
+        note = (
+            "Đã lưu vào danh sách yêu thích của bạn (xem lại bằng `/favorites`)."
+            if saved else
+            "Ảnh này bạn đã lưu từ trước rồi (đã có trong `/favorites`)."
+        )
+
+        # Cố gắng lấy thêm thông tin ảnh (định dạng, dung lượng) qua HEAD request.
+        # Không bắt buộc phải thành công — nếu lỗi/timeout thì bỏ qua, chỉ dùng ghi chú thường.
+        info_text = await bot.loop.run_in_executor(None, _try_get_image_info, url)
+
+        dm_embed = discord.Embed(title=f"💾 Ảnh đã lưu — {label}", description=f"✅ {note}", color=discord.Color.green())
+        dm_embed.set_image(url=url)
+        if info_text:
+            dm_embed.add_field(name="Thông tin ảnh", value=info_text, inline=False)
+
+        dm_ok = False
+        dm_error_text = None
+        try:
+            await interaction.user.send(embed=dm_embed)
+            dm_ok = True
+        except discord.Forbidden:
+            dm_error_text = "Tài khoản của bạn đang tắt nhận tin nhắn riêng (DM) từ thành viên server này."
+        except discord.HTTPException as e:
+            dm_error_text = f"Lỗi khi gửi tin nhắn riêng qua Discord: {e}"
+        except Exception as e:
+            dm_error_text = f"Lỗi không xác định khi gửi tin nhắn riêng: {e}"
+
+        if dm_ok:
+            await interaction.followup.send("✅ Đã lưu và gửi ảnh vào tin nhắn riêng (DM) của bạn.", ephemeral=True)
+            return
+
+        logger.warning(f"Không gửi được DM lưu ảnh cho user {interaction.user.id}: {dm_error_text}")
+
+        fail_embed = discord.Embed(
+            title="⚠️ Đã lưu ảnh, nhưng không gửi được tin nhắn riêng (DM)",
+            description=f"{note}\n\n**Lý do không gửi được DM:** {dm_error_text}",
+            color=discord.Color.orange(),
+        )
+        fail_embed.set_image(url=url)
+        if info_text:
+            fail_embed.add_field(name="Thông tin ảnh", value=info_text, inline=False)
+        await interaction.followup.send(embed=fail_embed, ephemeral=True)
+
+
+EPHEMERAL_PAGINATOR_VIEW = EphemeralImagePaginator()
+
+
+async def _send_ephemeral_image_result(send_func, category_key: str, label: str, keyword: str, url: str, author_id: int):
+    """Giống _send_image_result nhưng dùng EPHEMERAL_PAGINATOR_VIEW (3 nút, có Lưu ảnh)."""
+    embed = _build_image_embed(label, url)
+    message = await send_func(embed=embed, view=EPHEMERAL_PAGINATOR_VIEW)
+    await bot.loop.run_in_executor(
+        None, db.save_paginator_session, str(message.id), category_key, label, keyword, [url], 0, author_id
+    )
+
+
+async def _send_ephemeral_image_list(send_func, label: str, images: list, author_id: int):
+    """
+    Giống _send_ephemeral_image_result nhưng nạp sẵn TOÀN BỘ danh sách ảnh
+    (không phải 1 ảnh rồi fetch thêm dần) — dùng cho /favorites, vì đây là
+    danh sách hữu hạn có sẵn, không cần gọi DB lại mỗi lần bấm Sau/Trước.
+    keyword để trống ("") để _paginator_navigate biết đây là danh sách hữu
+    hạn, không cố fetch thêm khi hết.
+    """
+    embed = _build_image_embed(label, images[0])
+    message = await send_func(embed=embed, view=EPHEMERAL_PAGINATOR_VIEW)
+    await bot.loop.run_in_executor(
+        None, db.save_paginator_session, str(message.id), "", label, "", images, 0, author_id
+    )
+
+
+class ShowcaseStartView(discord.ui.View):
+    """
+    Nút "Bắt đầu" trên showcase board (đăng bởi admin qua /showcase). Persistent,
+    custom_id cố định — tra category_key theo message.id trong DB (giống
+    paginator_sessions) thay vì nhúng vào custom_id, để dùng chung 1 view cho
+    mọi board dù có bao nhiêu chủ đề đi nữa.
+    """
+
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="🎲 Bắt đầu", style=discord.ButtonStyle.primary, custom_id="showcase:start")
+    async def start_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        message_id = str(interaction.message.id)
+        board = await bot.loop.run_in_executor(None, db.get_showcase_board, message_id)
+        if not board:
+            await interaction.response.send_message(
+                "❌ Bảng giới thiệu này thiếu dữ liệu (có thể tạo từ bản bot cũ), không dùng được nữa.",
+                ephemeral=True,
+            )
+            return
+
+        category_key = board["category_key"]
+        all_cats = await get_all_categories_async()
+        info = all_cats.get(category_key)
+        if not info:
+            await interaction.response.send_message("❌ Chủ đề này không còn tồn tại nữa.", ephemeral=True)
+            return
+
+        roles = getattr(interaction.user, "roles", None)
+        access_err = check_access(interaction.user.id, interaction.channel_id, roles)
+        if access_err:
+            await interaction.response.send_message(access_err, ephemeral=True)
+            return
+        wait = check_cooldown(interaction.user.id)
+        if wait:
+            await interaction.response.send_message(f"⏳ Chờ thêm {wait}s rồi thử lại nhé.", ephemeral=True)
+            return
+        mark_used(interaction.user.id)
+
+        await interaction.response.defer(ephemeral=True)
+        url = await _fetch_next_image_url(category_key, info["keyword"], [])
+        if not url:
+            await interaction.followup.send(f"❌ Không tìm thấy ảnh nào cho chủ đề: **{info['label']}**", ephemeral=True)
+            return
+
+        async def send_func(embed, view):
+            return await interaction.followup.send(embed=embed, view=view, wait=True)
+
+        await _send_ephemeral_image_result(send_func, category_key, info["label"], info["keyword"], url, interaction.user.id)
+
+
+SHOWCASE_VIEW = ShowcaseStartView()
 
 
 # ============================================================
@@ -562,6 +917,7 @@ async def addcategory_slash(interaction: discord.Interaction, slug: str, label: 
 
     await interaction.response.defer()
     await bot.loop.run_in_executor(None, db.add_custom_category, slug, label, keyword)
+    _invalidate_categories_cache()
     extra = await _maybe_crawl_new_category_now(slug, keyword)
     await interaction.followup.send(
         f"✅ Đã thêm chủ đề **{label}** (`{slug}`, từ khóa: `{keyword}`)." + extra +
@@ -589,6 +945,7 @@ async def addcategory_prefix(ctx, *, args: str = None):
 
     await ctx.typing()
     await bot.loop.run_in_executor(None, db.add_custom_category, slug, label, keyword)
+    _invalidate_categories_cache()
     extra = await _maybe_crawl_new_category_now(slug, keyword)
     await ctx.send(f"✅ Đã thêm chủ đề **{label}** (`{slug}`, từ khóa: `{keyword}`)." + extra)
 
@@ -618,6 +975,7 @@ async def editcategory_slash(interaction: discord.Interaction, slug: str, label:
 
     await interaction.response.defer(ephemeral=True)
     ok = await bot.loop.run_in_executor(None, db.edit_custom_category, slug, label, keyword)
+    _invalidate_categories_cache()
     if ok:
         await interaction.followup.send(f"✅ Đã cập nhật chủ đề `{slug}`.")
     else:
@@ -644,6 +1002,7 @@ async def editcategory_prefix(ctx, *, args: str = None):
 
     await ctx.typing()
     ok = await bot.loop.run_in_executor(None, db.edit_custom_category, slug, label or None, keyword or None)
+    _invalidate_categories_cache()
     if ok:
         await ctx.send(f"✅ Đã cập nhật chủ đề `{slug}`.")
     else:
@@ -667,6 +1026,7 @@ async def removecategory_slash(interaction: discord.Interaction, slug: str):
 
     await interaction.response.defer(ephemeral=True)
     removed = await bot.loop.run_in_executor(None, db.remove_custom_category, slug)
+    _invalidate_categories_cache()
     if removed:
         await interaction.followup.send(f"✅ Đã xoá chủ đề `{slug}`.")
     else:
@@ -689,6 +1049,7 @@ async def removecategory_prefix(ctx, slug: str = None):
 
     await ctx.typing()
     removed = await bot.loop.run_in_executor(None, db.remove_custom_category, slug)
+    _invalidate_categories_cache()
     if removed:
         await ctx.send(f"✅ Đã xoá chủ đề `{slug}`.")
     else:
@@ -765,6 +1126,110 @@ async def cleanup_prefix(ctx, chu_de: str = None):
     await ctx.typing()
     report = await bot.loop.run_in_executor(None, _cleanup_category, chu_de)
     await ctx.send(f"🧹 **{all_cats[chu_de]['label']}**: {report}")
+
+
+# ============================================================
+# Lệnh admin: /showcase, !showcase — đăng 1 "bảng giới thiệu" chủ đề vào
+# kênh: ảnh mẫu + tên chủ đề + tag admin quản lý + nút "Bắt đầu". Ai bấm
+# "Bắt đầu" sẽ nhận 1 phiên xem ảnh riêng tư (ephemeral, chỉ người bấm thấy).
+# ============================================================
+
+async def _post_showcase_board(target_channel, category_key: str, info: dict, admin_id: int):
+    """Trả về (message, error_text). error_text != None nếu thất bại."""
+    preview_url = await _fetch_next_image_url(category_key, info["keyword"], [])
+    if not preview_url:
+        return None, f"❌ Không lấy được ảnh mẫu cho chủ đề: **{info['label']}**"
+
+    embed = discord.Embed(title=f"🖼️ {info['label']}", color=discord.Color.gold())
+    embed.set_image(url=preview_url)
+    embed.add_field(name="Quản lý bởi", value=f"<@{admin_id}>", inline=True)
+    embed.add_field(name="Chủ đề", value=f"`{category_key}`", inline=True)
+    embed.set_footer(text="Bấm \"Bắt đầu\" để xem ảnh riêng tư, chỉ bạn thấy được.")
+
+    message = await target_channel.send(embed=embed, view=SHOWCASE_VIEW)
+    await bot.loop.run_in_executor(None, db.save_showcase_board, str(message.id), category_key)
+    return message, None
+
+
+@bot.tree.command(name="showcase", description="[Admin] Đăng bảng giới thiệu 1 chủ đề vào kênh (nút Bắt đầu cho mọi người bấm)")
+@app_commands.describe(chu_de="Chủ đề cần giới thiệu", kenh="Kênh muốn đăng (bỏ trống = kênh hiện tại)")
+@app_commands.autocomplete(chu_de=category_autocomplete)
+async def showcase_slash(interaction: discord.Interaction, chu_de: str, kenh: discord.TextChannel = None):
+    if not is_admin(interaction.user.id):
+        await interaction.response.send_message("⚠️ Chỉ admin mới dùng được lệnh này.", ephemeral=True)
+        return
+
+    all_cats = await get_all_categories_async()
+    info = all_cats.get(chu_de)
+    if not info:
+        await interaction.response.send_message(f"❌ Chủ đề không hợp lệ: {chu_de}", ephemeral=True)
+        return
+
+    target_channel = kenh or interaction.channel
+    await interaction.response.defer(ephemeral=True)
+
+    message, error = await _post_showcase_board(target_channel, chu_de, info, interaction.user.id)
+    if error:
+        await interaction.followup.send(error)
+        return
+    await interaction.followup.send(f"✅ Đã đăng bảng giới thiệu **{info['label']}** vào {target_channel.mention}.")
+
+
+@bot.command(name="showcase", help="[Admin] !showcase <chủ_đề> [#kênh] — đăng bảng giới thiệu chủ đề")
+async def showcase_prefix(ctx, chu_de: str = None, kenh: discord.TextChannel = None):
+    if not is_admin(ctx.author.id):
+        await ctx.send("⚠️ Chỉ admin mới dùng được lệnh này.")
+        return
+
+    all_cats = await get_all_categories_async()
+    if not chu_de or chu_de.lower() not in all_cats:
+        await ctx.send("⚠️ Vui lòng chọn 1 chủ đề hợp lệ.")
+        return
+
+    category_key = chu_de.lower()
+    info = all_cats[category_key]
+    target_channel = kenh or ctx.channel
+    await ctx.typing()
+
+    message, error = await _post_showcase_board(target_channel, category_key, info, ctx.author.id)
+    if error:
+        await ctx.send(error)
+        return
+    await ctx.send(f"✅ Đã đăng bảng giới thiệu **{info['label']}** vào {target_channel.mention}.")
+
+
+# ============================================================
+# Lệnh /favorites, !favorites — xem lại ảnh đã lưu qua nút "💾 Lưu ảnh"
+# ============================================================
+
+@bot.tree.command(name="favorites", description="Xem lại các ảnh bạn đã lưu")
+async def favorites_slash(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
+    urls = await bot.loop.run_in_executor(None, db.get_favorites, interaction.user.id)
+    if not urls:
+        await interaction.followup.send(
+            "📭 Bạn chưa lưu ảnh nào. Bấm nút 💾 Lưu ảnh khi xem ảnh (qua showcase board) để thêm vào đây.",
+            ephemeral=True,
+        )
+        return
+
+    async def send_func(embed, view):
+        return await interaction.followup.send(embed=embed, view=view, wait=True)
+
+    await _send_ephemeral_image_list(send_func, f"⭐ Ảnh đã lưu của bạn ({len(urls)} ảnh)", urls, interaction.user.id)
+
+
+@bot.command(name="favorites", help="Xem lại các ảnh bạn đã lưu")
+async def favorites_prefix(ctx):
+    urls = await bot.loop.run_in_executor(None, db.get_favorites, ctx.author.id)
+    if not urls:
+        await ctx.send("📭 Bạn chưa lưu ảnh nào. Bấm nút 💾 Lưu ảnh khi xem ảnh (qua showcase board) để thêm vào đây.")
+        return
+
+    async def send_func(embed, view):
+        return await ctx.send(embed=embed, view=view)
+
+    await _send_ephemeral_image_list(send_func, f"⭐ Ảnh đã lưu của bạn ({len(urls)} ảnh)", urls, ctx.author.id)
 
 
 TOKEN = os.getenv("DISCORD_TOKEN")

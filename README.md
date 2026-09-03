@@ -59,6 +59,7 @@ pip install -r requirements.txt
 | `ALLOWED_CHANNEL_IDS` | `bot.py` (Render), tuỳ chọn | Nếu set, lệnh ảnh (`/img`, `!img`, `/random`, `!random`) chỉ dùng được ở các kênh này (ID, cách nhau bởi dấu phẩy). Để trống = không giới hạn kênh. Admin luôn bypass. |
 | `ALLOWED_ROLE_IDS` | `bot.py` (Render), tuỳ chọn | Nếu set, chỉ member có 1 trong các role này mới dùng được lệnh ảnh (ID, cách nhau bởi dấu phẩy). Để trống = không giới hạn role. Admin luôn bypass. |
 | `DISCORD_WEBHOOK_URL` | `crawl_job.py` (GitHub Actions Secret), tuỳ chọn | Webhook Discord để nhận cảnh báo khi crawl lỗi toàn bộ hoặc 1 category sắp cạn ảnh. Bỏ trống thì chỉ ghi log, không gửi cảnh báo. |
+| `LOG_CHANNEL_ID` | `bot.py` (Render), tuỳ chọn | ID kênh Discord nhận log lỗi tự động (mọi `logger.warning`/`logger.error` trong bot) + heartbeat ping mỗi 10 phút. Bỏ trống = tắt tính năng này, chỉ log ra Render logs như trước. |
 
 Tạo `MONGO_URI` ở 2 nơi riêng biệt vì đây là 2 môi trường chạy khác nhau:
 - Render → Environment variables (cho `bot.py`)
@@ -112,6 +113,30 @@ hay sau khi bot restart, vì trạng thái phiên xem ảnh được lưu trong 
 | `!removecategory <slug>` | Prefix | Tương tự |
 | `/cleanup <chủ_đề>` | Slash | Dọn ảnh lỗi link (404...) và ảnh đã gửi ≥ 20 lần trong 1 chủ đề |
 | `!cleanup <chủ_đề>` | Prefix | Tương tự |
+| `/showcase <chủ_đề> [kênh]` | Slash | Đăng "bảng giới thiệu" 1 chủ đề vào kênh: ảnh mẫu + tag admin + nút "🎲 Bắt đầu" cho mọi người bấm |
+| `!showcase <chủ_đề> [#kênh]` | Prefix | Tương tự, kênh bỏ trống = kênh hiện tại |
+
+### Lệnh cho mọi người
+
+| Lệnh | Loại | Mô tả |
+|---|---|---|
+| `/favorites` | Slash | Xem lại các ảnh đã lưu qua nút 💾 Lưu ảnh |
+| `!favorites` | Prefix | Tương tự |
+
+## Showcase board — bảng giới thiệu chủ đề
+
+`/showcase` tạo 1 embed cố định trong kênh (ảnh mẫu, tên chủ đề, tag admin
+quản lý ở góc embed) kèm nút **"🎲 Bắt đầu"**. Ai bấm nút này sẽ nhận 1 embed
+**riêng tư** (ephemeral — chỉ người bấm thấy) chứa 1 ảnh ngẫu nhiên của chủ
+đề đó, kèm 3 nút:
+- **◀** / **▶** — chuyển ảnh (giống `/img`, ảnh mới lấy random từ MongoDB/fallback Pinterest khi cần)
+- **💾 Lưu ảnh** — lưu ảnh vào danh sách yêu thích cá nhân (xem lại bằng `/favorites`), đồng thời bot **gửi tin nhắn riêng (DM)** cho bạn kèm ảnh + ghi chú (kèm định dạng/dung lượng ảnh nếu lấy được). Nếu bạn tắt nhận DM từ thành viên server, bot vẫn lưu ảnh bình thường và báo lý do lỗi DM ngay tại kênh (chỉ bạn thấy được).
+
+Nút "Bắt đầu" trên showcase board hoạt động vĩnh viễn giống nút Trước/Sau
+(không hết hạn, không phụ thuộc bot có restart hay không) — bạn chỉ cần đăng
+1 lần, để đó lâu dài trong kênh.
+
+
 
 ## Thêm/sửa chủ đề (category)
 
@@ -137,6 +162,22 @@ lọc bớt nếu có nhiều hơn 25 category).
 - **Cảnh báo crawl job:** nếu set `DISCORD_WEBHOOK_URL`, bạn sẽ nhận tin nhắn
   Discord khi: (a) toàn bộ category crawl lỗi trong 1 lần chạy, hoặc (b) 1
   category còn dưới 5 ảnh khả dụng (sắp phải fallback cào trực tiếp liên tục).
+- **Kênh log Discord (`LOG_CHANNEL_ID`):** nếu set, mọi `logger.warning()` /
+  `logger.error()` trong `bot.py` (lỗi DB, lỗi Pinterest, lỗi đồng bộ lệnh,
+  ảnh chậm bất thường...) tự động được gửi vào kênh này — kèm icon 🟡
+  (warning) / 🔴 (error) — ngoài việc vẫn in ra Render logs như bình thường.
+  Đây là kênh riêng cho vận hành/debug, khác với `DISCORD_WEBHOOK_URL` (chỉ
+  dành cho crawl job).
+- **Heartbeat ping (`LOG_CHANNEL_ID`):** bot gửi 1 embed "Bot đang hoạt động"
+  kèm độ trễ vào kênh log ngay lúc khởi động, rồi lặp lại mỗi 10 phút. Mỗi
+  lần gửi ping mới, tin ping CŨ sẽ bị xoá trước — kênh log chỉ luôn có đúng 1
+  tin ping mới nhất, không bị trôi bởi hàng loạt tin ping cũ.
+- **Hiệu năng lấy ảnh:** mỗi lần `/img`/`/random` lấy ảnh, bot đo thời gian
+  đọc MongoDB và thời gian fallback cào Pinterest (nếu có), tự cảnh báo (và
+  gửi vào kênh log nếu bật) khi bước nào đó chậm bất thường (> 3s cho DB,
+  > 15s cho fallback Pinterest) — giúp xác định chỗ nghẽn khi bot phản hồi
+  chậm. Category (bao gồm cả category admin thêm qua Discord) được cache 30
+  giây để giảm số lần truy vấn MongoDB lặp lại không cần thiết.
 - **Backup MongoDB:** không nằm trong code — bật ở phía MongoDB Atlas
   (Atlas → cluster → Backup) nếu cần, Atlas hỗ trợ backup tự động định kỳ.
 
