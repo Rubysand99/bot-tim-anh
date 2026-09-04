@@ -15,6 +15,7 @@ from pinterest_crawler import search_pinterest_images_with_retry
 from categories import CATEGORIES
 import db
 import crawl_job
+from version import __version__, __description__
 
 logging.basicConfig(
     level=logging.INFO,
@@ -294,6 +295,28 @@ async def ping_slash(interaction: discord.Interaction):
 @bot.command(name="ping", help="Kiểm tra độ trễ của bot")
 async def ping_prefix(ctx):
     await ctx.send(f"🏓 Pong! Độ trễ: **{_format_latency_ms()}**")
+
+
+# ============================================================
+# Lệnh version — xem số bản hiện tại + mô tả ngắn (sửa trong version.py)
+# ============================================================
+
+def _version_embed() -> discord.Embed:
+    return discord.Embed(
+        title=f"🏷️ Phiên bản v{__version__}",
+        description=__description__,
+        color=discord.Color.blurple(),
+    )
+
+
+@bot.tree.command(name="version", description="Xem số phiên bản hiện tại của bot")
+async def version_slash(interaction: discord.Interaction):
+    await interaction.response.send_message(embed=_version_embed())
+
+
+@bot.command(name="version", help="Xem số phiên bản hiện tại của bot")
+async def version_prefix(ctx):
+    await ctx.send(embed=_version_embed())
 
 
 # ============================================================

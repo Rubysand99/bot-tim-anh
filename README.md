@@ -96,6 +96,8 @@ DISCORD_TOKEN="..." MONGO_URI="mongodb+srv://..." python bot.py
 | `!stats` | Prefix | Tương tự `/stats` |
 | `/ping` | Slash | Xem độ trễ bot |
 | `!ping` | Prefix | Xem độ trễ bot |
+| `/version` | Slash | Xem số phiên bản hiện tại + mô tả ngắn (sửa trong `version.py`) |
+| `!version` | Prefix | Tương tự `/version` |
 
 **Cooldown:** người dùng thường bị giới hạn 8 giây/lần cho `/img`, `!img`,
 `/random`, `!random`. Admin (`ADMIN_USER_IDS`) không bị giới hạn này.
