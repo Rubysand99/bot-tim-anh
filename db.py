@@ -17,7 +17,6 @@ CUSTOM_CATEGORIES_COLLECTION = "custom_categories"
 META_COLLECTION = "meta"
 PAGINATOR_SESSIONS_COLLECTION = "paginator_sessions"
 SHOWCASE_BOARDS_COLLECTION = "showcase_boards"
-FAVORITES_COLLECTION = "favorites"
 GUILD_CONFIGS_COLLECTION = "guild_configs"
 
 _client = None
@@ -42,10 +41,6 @@ def get_db():
         collection.create_index([("image_url", ASCENDING)], unique=True)
         # index hỗ trợ query theo category + trạng thái đã gửi
         collection.create_index([("category", ASCENDING), ("last_sent_at", ASCENDING)])
-        # unique index: 1 user không lưu trùng cùng 1 ảnh vào favorites 2 lần
-        _db[FAVORITES_COLLECTION].create_index(
-            [("user_id", ASCENDING), ("image_url", ASCENDING)], unique=True
-        )
     return _db
 
 
@@ -343,44 +338,6 @@ def save_showcase_board(message_id: str, category_key: str) -> None:
 def get_showcase_board(message_id: str):
     db = get_db()
     return db[SHOWCASE_BOARDS_COLLECTION].find_one({"_id": message_id})
-
-
-# ============================================================
-# Ảnh yêu thích (favorites) — mỗi user lưu ảnh riêng qua nút "💾 Lưu ảnh".
-# ============================================================
-
-def add_favorite(user_id: int, category_key: str, image_url: str) -> bool:
-    """Trả về True nếu lưu mới, False nếu ảnh này user đã lưu từ trước."""
-    db = get_db()
-    try:
-        db[FAVORITES_COLLECTION].insert_one({
-            "user_id": user_id,
-            "category_key": category_key,
-            "image_url": image_url,
-            "saved_at": now_utc(),
-        })
-        return True
-    except DuplicateKeyError:
-        return False
-
-
-def get_favorites(user_id: int) -> list:
-    """Trả về danh sách URL ảnh yêu thích của user, mới lưu nhất trước."""
-    db = get_db()
-    docs = db[FAVORITES_COLLECTION].find({"user_id": user_id}).sort("saved_at", -1)
-    return [d["image_url"] for d in docs]
-
-
-def count_favorites(user_id: int) -> int:
-    db = get_db()
-    return db[FAVORITES_COLLECTION].count_documents({"user_id": user_id})
-
-
-def remove_favorite(user_id: int, image_url: str) -> bool:
-    """Trả về True nếu xoá được (ảnh đó có trong favorites của user)."""
-    db = get_db()
-    result = db[FAVORITES_COLLECTION].delete_one({"user_id": user_id, "image_url": image_url})
-    return result.deleted_count > 0
 
 
 # ============================================================
