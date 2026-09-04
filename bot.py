@@ -3,6 +3,7 @@ import concurrent.futures
 import logging
 import os
 import random
+import sys
 import time
 from datetime import datetime, timezone, timedelta
 
@@ -1674,13 +1675,22 @@ if __name__ == "__main__":
     else:
         keep_alive()
 
-        while True:
-            try:
-                bot.run(TOKEN)
-                break
-            except discord.errors.HTTPException as e:
-                if e.status == 429:
-                    logger.warning("Bị Discord Rate Limit 429. Đang chờ 60 giây để thử lại...")
-                    time.sleep(60)
-                else:
-                    raise e
+        # LƯU Ý: KHÔNG tự retry bot.run(TOKEN) trong vòng lặp trên cùng 1
+        # process — sau khi bot.run() dừng (kể cả do lỗi), discord.py đóng
+        # session HTTP nội bộ của object `bot`, nên gọi lại bot.run() trên
+        # cùng object sẽ luôn crash với "RuntimeError: Session is closed",
+        # KHÔNG PHẢI retry thật. Cách đúng: chờ rồi thoát hẳn tiến trình,
+        # để Render tự khởi động lại process MỚI (bot object mới tinh).
+        try:
+            bot.run(TOKEN)
+        except discord.errors.HTTPException as e:
+            if e.status == 429:
+                logger.warning(
+                    "Bị Discord Rate Limit 429 khi đăng nhập. Chờ 60 giây rồi "
+                    "thoát tiến trình để Render tự khởi động lại (không retry "
+                    "trong cùng process vì session HTTP đã bị đóng)."
+                )
+                time.sleep(60)
+                sys.exit(1)
+            else:
+                raise
