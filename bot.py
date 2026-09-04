@@ -111,15 +111,51 @@ def is_admin(user_id: int) -> bool:
     return user_id in ADMIN_IDS
 
 
-def check_access(user_id: int, channel_id: int, roles) -> str:
-    """Trả về thông báo lỗi nếu bị chặn, chuỗi rỗng nếu được phép dùng lệnh."""
+# Cache cấu hình riêng theo guild (per-server) — tránh mỗi lần dùng lệnh đều
+# phải round-trip MongoDB để đọc ALLOWED_CHANNEL_IDS/ALLOWED_ROLE_IDS của
+# server đó. /config chủ động xoá cache ngay sau khi sửa nên vẫn có hiệu
+# lực tức thì.
+_guild_config_cache = {}  # guild_id -> (data, timestamp)
+GUILD_CONFIG_CACHE_TTL_SECONDS = 30
+
+
+def _invalidate_guild_config_cache(guild_id: int) -> None:
+    _guild_config_cache.pop(guild_id, None)
+
+
+async def _get_guild_config_cached(guild_id: int) -> dict:
+    now = time.monotonic()
+    cached = _guild_config_cache.get(guild_id)
+    if cached and (now - cached[1]) < GUILD_CONFIG_CACHE_TTL_SECONDS:
+        return cached[0]
+    data = await bot.loop.run_in_executor(None, db.get_guild_config, guild_id)
+    _guild_config_cache[guild_id] = (data, now)
+    return data
+
+
+async def check_access(user_id: int, guild_id, channel_id: int, roles) -> str:
+    """
+    Trả về thông báo lỗi nếu bị chặn, chuỗi rỗng nếu được phép dùng lệnh.
+    Ưu tiên cấu hình riêng của server (đặt qua /config) nếu server đó đã
+    từng cấu hình; nếu chưa, dùng ALLOWED_CHANNEL_IDS/ALLOWED_ROLE_IDS từ
+    biến môi trường (mặc định toàn cục, giữ tương thích ngược). Ở DM
+    (guild_id=None) luôn dùng biến môi trường vì không có server nào để tra.
+    """
     if is_admin(user_id):
         return ""
-    if ALLOWED_CHANNEL_IDS and channel_id not in ALLOWED_CHANNEL_IDS:
+
+    if guild_id is None:
+        allowed_channels, allowed_roles = ALLOWED_CHANNEL_IDS, ALLOWED_ROLE_IDS
+    else:
+        cfg = await _get_guild_config_cached(guild_id)
+        allowed_channels = set(cfg["allowed_channel_ids"]) if cfg["allowed_channel_ids"] else ALLOWED_CHANNEL_IDS
+        allowed_roles = set(cfg["allowed_role_ids"]) if cfg["allowed_role_ids"] else ALLOWED_ROLE_IDS
+
+    if allowed_channels and channel_id not in allowed_channels:
         return "⚠️ Lệnh này chỉ dùng được ở kênh được chỉ định."
-    if ALLOWED_ROLE_IDS:
+    if allowed_roles:
         role_ids = {r.id for r in roles} if roles else set()
-        if not (role_ids & ALLOWED_ROLE_IDS):
+        if not (role_ids & allowed_roles):
             return "⚠️ Bạn không có quyền dùng lệnh này."
     return ""
 
@@ -276,6 +312,21 @@ def _invalidate_categories_cache() -> None:
     _categories_cache["at"] = 0.0
 
 
+def _channel_allows_nsfw(channel) -> bool:
+    """
+    True nếu kênh đã được Discord đánh dấu Age-Restricted (NSFW). DM hoặc
+    kênh không có thuộc tính is_nsfw (hiếm) coi như KHÔNG cho phép, để an
+    toàn hơn là mặc định cho phép.
+    """
+    is_nsfw_fn = getattr(channel, "is_nsfw", None)
+    if is_nsfw_fn is None:
+        return False
+    try:
+        return bool(is_nsfw_fn())
+    except Exception:
+        return False
+
+
 async def get_all_categories_async() -> dict:
     now = time.monotonic()
     if _categories_cache["data"] is not None and (now - _categories_cache["at"]) < CATEGORIES_CACHE_TTL_SECONDS:
@@ -316,6 +367,33 @@ async def category_autocomplete(interaction: discord.Interaction, current: str):
 SLOW_DB_THRESHOLD_SECONDS = 3
 SLOW_CRAWL_THRESHOLD_SECONDS = 15
 
+# Circuit breaker cho fallback Pinterest: nếu thất bại liên tiếp quá
+# nhiều lần trong thời gian ngắn (dấu hiệu Pinterest đang chặn/lỗi diện
+# rộng), tạm ngừng thử fallback một thời gian thay vì cứ bắt user chờ
+# timeout mỗi lần — vừa nhanh hơn, vừa giảm rủi ro bị chặn IP nặng hơn.
+PINTEREST_CIRCUIT_FAIL_THRESHOLD = 3
+PINTEREST_CIRCUIT_OPEN_SECONDS = 300  # 5 phút
+
+_pinterest_circuit = {"fail_count": 0, "open_until": 0.0}
+
+
+def _pinterest_circuit_is_open() -> bool:
+    return time.monotonic() < _pinterest_circuit["open_until"]
+
+
+def _pinterest_circuit_record_result(success: bool) -> None:
+    if success:
+        _pinterest_circuit["fail_count"] = 0
+        return
+    _pinterest_circuit["fail_count"] += 1
+    if _pinterest_circuit["fail_count"] >= PINTEREST_CIRCUIT_FAIL_THRESHOLD:
+        _pinterest_circuit["open_until"] = time.monotonic() + PINTEREST_CIRCUIT_OPEN_SECONDS
+        logger.warning(
+            f"Circuit breaker MỞ cho fallback Pinterest: thất bại "
+            f"{PINTEREST_CIRCUIT_FAIL_THRESHOLD} lần liên tiếp, tạm ngừng thử trong "
+            f"{PINTEREST_CIRCUIT_OPEN_SECONDS // 60} phút."
+        )
+
 
 async def _fetch_next_image_url(category_key: str, keyword: str, exclude_urls: list):
     def fetch_db():
@@ -337,6 +415,11 @@ async def _fetch_next_image_url(category_key: str, keyword: str, exclude_urls: l
     if url:
         return url
 
+    if _pinterest_circuit_is_open():
+        remaining = int(_pinterest_circuit["open_until"] - time.monotonic())
+        logger.info(f"[circuit] Bỏ qua fallback Pinterest (đang tạm ngừng, còn {remaining}s).")
+        return None
+
     def fetch_crawl():
         try:
             results = search_pinterest_images_with_retry(keyword, limit=20, retries=3)
@@ -355,6 +438,8 @@ async def _fetch_next_image_url(category_key: str, keyword: str, exclude_urls: l
         logger.warning(f"Fallback cào Pinterest cho '{category_key}' chậm bất thường: {crawl_elapsed:.1f}s")
     else:
         logger.info(f"[perf] Fallback cào Pinterest cho '{category_key}': {crawl_elapsed:.2f}s")
+
+    _pinterest_circuit_record_result(success=url is not None)
 
     return url
 
@@ -402,6 +487,9 @@ async def _send_image_result(send_func, category_key: str, label: str, keyword: 
     )
 
 
+MAX_FAVORITES_PER_USER = 100
+
+
 async def _paginator_navigate(interaction: discord.Interaction, direction: int, view: discord.ui.View):
     """
     Logic điều hướng dùng chung cho cả PersistentImagePaginator (nút Trước/Sau
@@ -425,6 +513,14 @@ async def _paginator_navigate(interaction: discord.Interaction, direction: int, 
 
     images = session["images"]
     index = session["index"]
+
+    # Chuẩn hoá lại view theo DỮ LIỆU SESSION (không phụ thuộc instance nào
+    # đang xử lý callback này) — quan trọng vì sau khi bot restart, Discord
+    # có thể route interaction qua bất kỳ instance đã đăng ký persistent nào
+    # có cùng custom_id, không nhất thiết là instance có nhãn nút đúng ngữ
+    # cảnh. Chỉ áp dụng cho họ EphemeralImagePaginator (có nút Lưu/Xoá).
+    if isinstance(view, EphemeralImagePaginator) and session.get("category_key") == "":
+        view = FAVORITES_PAGINATOR_VIEW
 
     if direction < 0:
         index = max(0, index - 1)
@@ -488,10 +584,16 @@ class EphemeralImagePaginator(discord.ui.View):
     phiên xem riêng tư (ephemeral) mở ra sau khi bấm "Bắt đầu" ở showcase
     board, hoặc khi xem lại /favorites. custom_id khác PAGINATOR_VIEW để
     Discord phân biệt được 2 view khi cùng đăng ký persistent.
+
+    save_button_label/style tuỳ biến được vì cùng 1 nút này đóng 2 vai trò
+    khác nhau tuỳ ngữ cảnh: "Lưu ảnh" khi xem qua showcase, "Xoá khỏi yêu
+    thích" khi xem qua /favorites (xem FAVORITES_PAGINATOR_VIEW bên dưới).
     """
 
-    def __init__(self):
+    def __init__(self, save_button_label: str = "💾 Lưu ảnh", save_button_style: discord.ButtonStyle = discord.ButtonStyle.success):
         super().__init__(timeout=None)
+        self.save_button.label = save_button_label
+        self.save_button.style = save_button_style
 
     @discord.ui.button(label="◀", style=discord.ButtonStyle.secondary, custom_id="epaginator:prev")
     async def previous_button(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -509,12 +611,32 @@ class EphemeralImagePaginator(discord.ui.View):
             await interaction.response.send_message("⚠️ Không tìm thấy dữ liệu ảnh này nữa.", ephemeral=True)
             return
         if interaction.user.id != session["author_id"]:
-            await interaction.response.send_message("⚠️ Bạn không thể lưu ảnh của người khác.", ephemeral=True)
+            await interaction.response.send_message("⚠️ Bạn không thể thao tác trên phiên của người khác.", ephemeral=True)
             return
 
         url = session["images"][session["index"]]
+
+        # Đang xem qua /favorites (category_key rỗng là dấu hiệu nhận biết) ->
+        # nút này đổi vai trò thành "Xoá khỏi yêu thích" vì ảnh đang xem chắc
+        # chắn đã có sẵn trong favorites rồi, "lưu lại" không có ý nghĩa gì.
+        if session["category_key"] == "":
+            await self._remove_from_favorites(interaction, session, message_id, url)
+            return
+
+        await self._add_to_favorites(interaction, session, url)
+
+    async def _add_to_favorites(self, interaction: discord.Interaction, session: dict, url: str):
         label = session["label"]
         await interaction.response.defer(ephemeral=True)
+
+        current_count = await bot.loop.run_in_executor(None, db.count_favorites, interaction.user.id)
+        if current_count >= MAX_FAVORITES_PER_USER:
+            await interaction.followup.send(
+                f"⚠️ Bạn đã lưu tối đa **{MAX_FAVORITES_PER_USER}** ảnh yêu thích rồi. "
+                f"Dùng `/favorites` rồi bấm 🗑️ để xoá bớt trước khi lưu thêm.",
+                ephemeral=True,
+            )
+            return
 
         saved = await bot.loop.run_in_executor(
             None, db.add_favorite, interaction.user.id, session["category_key"], url
@@ -562,8 +684,44 @@ class EphemeralImagePaginator(discord.ui.View):
             fail_embed.add_field(name="Thông tin ảnh", value=info_text, inline=False)
         await interaction.followup.send(embed=fail_embed, ephemeral=True)
 
+    async def _remove_from_favorites(self, interaction: discord.Interaction, session: dict, message_id: str, url: str):
+        removed = await bot.loop.run_in_executor(None, db.remove_favorite, interaction.user.id, url)
+        if not removed:
+            await interaction.response.send_message(
+                "ℹ️ Ảnh này không có trong danh sách yêu thích (có thể đã bị xoá từ trước).", ephemeral=True
+            )
+            return
+
+        images = list(session["images"])
+        index = session["index"]
+        images.pop(index)
+
+        if not images:
+            await bot.loop.run_in_executor(None, db.update_paginator_session, message_id, [], 0)
+            empty_embed = discord.Embed(
+                title="⭐ Ảnh đã lưu của bạn",
+                description="📭 Danh sách yêu thích hiện đang trống.",
+                color=discord.Color.blurple(),
+            )
+            await interaction.response.edit_message(embed=empty_embed, view=None)
+            return
+
+        index = min(index, len(images) - 1)
+        await bot.loop.run_in_executor(None, db.update_paginator_session, message_id, images, index)
+        await interaction.response.edit_message(
+            embed=_build_image_embed(session["label"], images[index]), view=FAVORITES_PAGINATOR_VIEW
+        )
+
 
 EPHEMERAL_PAGINATOR_VIEW = EphemeralImagePaginator()
+
+# Bản riêng cho /favorites — cùng custom_id (nên không cần bot.add_view()
+# đăng ký thêm, dispatch vẫn tự route qua EPHEMERAL_PAGINATOR_VIEW đã đăng
+# ký), chỉ khác nhãn/màu nút "Lưu ảnh" -> "Xoá khỏi yêu thích" cho đúng ngữ
+# cảnh khi gửi tin nhắn lần đầu.
+FAVORITES_PAGINATOR_VIEW = EphemeralImagePaginator(
+    save_button_label="🗑️ Xoá khỏi yêu thích", save_button_style=discord.ButtonStyle.danger
+)
 
 
 async def _send_ephemeral_image_result(send_func, category_key: str, label: str, keyword: str, url: str, author_id: int):
@@ -584,7 +742,7 @@ async def _send_ephemeral_image_list(send_func, label: str, images: list, author
     hạn, không cố fetch thêm khi hết.
     """
     embed = _build_image_embed(label, images[0])
-    message = await send_func(embed=embed, view=EPHEMERAL_PAGINATOR_VIEW)
+    message = await send_func(embed=embed, view=FAVORITES_PAGINATOR_VIEW)
     await bot.loop.run_in_executor(
         None, db.save_paginator_session, str(message.id), "", label, "", images, 0, author_id
     )
@@ -618,9 +776,14 @@ class ShowcaseStartView(discord.ui.View):
         if not info:
             await interaction.response.send_message("❌ Chủ đề này không còn tồn tại nữa.", ephemeral=True)
             return
+        if info.get("nsfw") and not _channel_allows_nsfw(interaction.channel):
+            await interaction.response.send_message(
+                "🔞 Chủ đề này chỉ dùng được ở kênh đã đánh dấu Age-Restricted (NSFW).", ephemeral=True
+            )
+            return
 
         roles = getattr(interaction.user, "roles", None)
-        access_err = check_access(interaction.user.id, interaction.channel_id, roles)
+        access_err = await check_access(interaction.user.id, interaction.guild_id, interaction.channel_id, roles)
         if access_err:
             await interaction.response.send_message(access_err, ephemeral=True)
             return
@@ -656,7 +819,7 @@ SHOWCASE_VIEW = ShowcaseStartView()
 @app_commands.autocomplete(chu_de=category_autocomplete)
 async def img_slash(interaction: discord.Interaction, chu_de: str):
     roles = getattr(interaction.user, "roles", None)
-    access_err = check_access(interaction.user.id, interaction.channel_id, roles)
+    access_err = await check_access(interaction.user.id, interaction.guild_id, interaction.channel_id, roles)
     if access_err:
         await interaction.response.send_message(access_err, ephemeral=True)
         return
@@ -673,6 +836,11 @@ async def img_slash(interaction: discord.Interaction, chu_de: str):
     if not info:
         await interaction.followup.send(f"❌ Chủ đề không hợp lệ: **{chu_de}**")
         return
+    if info.get("nsfw") and not _channel_allows_nsfw(interaction.channel):
+        await interaction.followup.send(
+            f"🔞 Chủ đề **{info['label']}** chỉ dùng được ở kênh đã đánh dấu Age-Restricted (NSFW)."
+        )
+        return
 
     url = await _fetch_next_image_url(chu_de, info["keyword"], [])
     if not url:
@@ -688,7 +856,7 @@ async def img_slash(interaction: discord.Interaction, chu_de: str):
 @bot.command(name="img", help="Lấy ảnh theo chủ đề. Vd: !img meo")
 async def img_prefix(ctx, chu_de: str = None):
     roles = getattr(ctx.author, "roles", None)
-    access_err = check_access(ctx.author.id, ctx.channel.id, roles)
+    access_err = await check_access(ctx.author.id, ctx.guild.id if ctx.guild else None, ctx.channel.id, roles)
     if access_err:
         await ctx.send(access_err)
         return
@@ -707,6 +875,9 @@ async def img_prefix(ctx, chu_de: str = None):
 
     category_key = chu_de.lower()
     info = all_cats[category_key]
+    if info.get("nsfw") and not _channel_allows_nsfw(ctx.channel):
+        await ctx.send(f"🔞 Chủ đề **{info['label']}** chỉ dùng được ở kênh đã đánh dấu Age-Restricted (NSFW).")
+        return
     await ctx.typing()
 
     url = await _fetch_next_image_url(category_key, info["keyword"], [])
@@ -725,20 +896,28 @@ async def img_prefix(ctx, chu_de: str = None):
 # (không phải random category rồi mới chọn ảnh trong đó).
 # ============================================================
 
-async def _get_random_image_result():
+async def _get_random_image_result(channel):
     """Trả về (category_key, label, keyword, url) hoặc (None, None, None, None) nếu hết ảnh."""
-    doc = await bot.loop.run_in_executor(None, db.get_random_image, None)
     all_cats = await get_all_categories_async()
+    channel_nsfw_ok = _channel_allows_nsfw(channel)
+
+    # Chỉ random trong các category được phép ở kênh này (loại NSFW nếu kênh
+    # chưa đánh dấu Age-Restricted) để tránh /random vô tình đưa ảnh nhạy
+    # cảm vào kênh thường.
+    allowed_keys = [k for k, info in all_cats.items() if channel_nsfw_ok or not info.get("nsfw")]
+    if not allowed_keys:
+        return None, None, None, None
+
+    doc = await bot.loop.run_in_executor(None, db.get_random_image, None, allowed_keys)
 
     if doc:
         category_key = doc["category"]
         info = all_cats.get(category_key, {"label": category_key, "keyword": category_key})
         return category_key, info["label"], info["keyword"], doc["image_url"]
 
-    # DB trống hoàn toàn ảnh khả dụng -> fallback: random 1 chủ đề rồi cào trực tiếp
-    if not all_cats:
-        return None, None, None, None
-    category_key = random.choice(list(all_cats.keys()))
+    # DB trống hoàn toàn ảnh khả dụng (trong phạm vi allowed_keys) -> fallback:
+    # random 1 chủ đề (vẫn trong allowed_keys) rồi cào trực tiếp
+    category_key = random.choice(allowed_keys)
     info = all_cats[category_key]
     url = await _fetch_next_image_url(category_key, info["keyword"], [])
     if not url:
@@ -749,7 +928,7 @@ async def _get_random_image_result():
 @bot.tree.command(name="random", description="Lấy 1 ảnh ngẫu nhiên bất kỳ trong toàn bộ kho")
 async def random_slash(interaction: discord.Interaction):
     roles = getattr(interaction.user, "roles", None)
-    access_err = check_access(interaction.user.id, interaction.channel_id, roles)
+    access_err = await check_access(interaction.user.id, interaction.guild_id, interaction.channel_id, roles)
     if access_err:
         await interaction.response.send_message(access_err, ephemeral=True)
         return
@@ -761,7 +940,7 @@ async def random_slash(interaction: discord.Interaction):
 
     await interaction.response.defer()
 
-    category_key, label, keyword, url = await _get_random_image_result()
+    category_key, label, keyword, url = await _get_random_image_result(interaction.channel)
     if not url:
         await interaction.followup.send("❌ Kho ảnh hiện đang trống, thử lại sau nhé.")
         return
@@ -775,7 +954,7 @@ async def random_slash(interaction: discord.Interaction):
 @bot.command(name="random", help="Lấy 1 ảnh ngẫu nhiên bất kỳ trong toàn bộ kho")
 async def random_prefix(ctx):
     roles = getattr(ctx.author, "roles", None)
-    access_err = check_access(ctx.author.id, ctx.channel.id, roles)
+    access_err = await check_access(ctx.author.id, ctx.guild.id if ctx.guild else None, ctx.channel.id, roles)
     if access_err:
         await ctx.send(access_err)
         return
@@ -787,7 +966,7 @@ async def random_prefix(ctx):
 
     await ctx.typing()
 
-    category_key, label, keyword, url = await _get_random_image_result()
+    category_key, label, keyword, url = await _get_random_image_result(ctx.channel)
     if not url:
         await ctx.send("❌ Kho ảnh hiện đang trống, thử lại sau nhé.")
         return
@@ -898,8 +1077,9 @@ async def _maybe_crawl_new_category_now(slug: str, keyword: str) -> str:
     slug="Mã chủ đề, không dấu/không khoảng trắng (vd: hoahong)",
     label="Tên hiển thị trong Discord",
     keyword="Từ khóa tìm kiếm trên Pinterest",
+    nsfw="Chủ đề nhạy cảm, chỉ dùng được ở kênh Age-Restricted? (mặc định: Không)",
 )
-async def addcategory_slash(interaction: discord.Interaction, slug: str, label: str, keyword: str):
+async def addcategory_slash(interaction: discord.Interaction, slug: str, label: str, keyword: str, nsfw: bool = False):
     if not is_admin(interaction.user.id):
         await interaction.response.send_message("⚠️ Chỉ admin mới dùng được lệnh này.", ephemeral=True)
         return
@@ -916,25 +1096,28 @@ async def addcategory_slash(interaction: discord.Interaction, slug: str, label: 
         return
 
     await interaction.response.defer()
-    await bot.loop.run_in_executor(None, db.add_custom_category, slug, label, keyword)
+    await bot.loop.run_in_executor(None, db.add_custom_category, slug, label, keyword, nsfw)
     _invalidate_categories_cache()
     extra = await _maybe_crawl_new_category_now(slug, keyword)
+    nsfw_note = " 🔞 (đánh dấu NSFW)" if nsfw else ""
     await interaction.followup.send(
-        f"✅ Đã thêm chủ đề **{label}** (`{slug}`, từ khóa: `{keyword}`)." + extra +
+        f"✅ Đã thêm chủ đề **{label}** (`{slug}`, từ khóa: `{keyword}`){nsfw_note}." + extra +
         f"\nDùng ngay được với `/img` (gõ để autocomplete) hoặc `!img {slug}`."
     )
 
 
-@bot.command(name="addcategory", help="[Admin] !addcategory slug | Label hiển thị | từ khóa Pinterest")
+@bot.command(name="addcategory", help="[Admin] !addcategory slug | Label hiển thị | từ khóa Pinterest [| nsfw]")
 async def addcategory_prefix(ctx, *, args: str = None):
     if not is_admin(ctx.author.id):
         await ctx.send("⚠️ Chỉ admin mới dùng được lệnh này.")
         return
-    if not args or args.count("|") != 2:
-        await ctx.send("⚠️ Cú pháp: `!addcategory slug | Label hiển thị | từ khóa Pinterest`")
+    if not args or args.count("|") not in (2, 3):
+        await ctx.send("⚠️ Cú pháp: `!addcategory slug | Label hiển thị | từ khóa Pinterest [| nsfw]`")
         return
 
-    slug, label, keyword = [p.strip() for p in args.split("|")]
+    parts = [p.strip() for p in args.split("|")]
+    slug, label, keyword = parts[0], parts[1], parts[2]
+    nsfw = len(parts) == 4 and parts[3].lower() in ("nsfw", "true", "1", "có")
     slug = slug.lower()
     if not slug or " " in slug:
         await ctx.send("⚠️ Slug không hợp lệ (không dấu cách).")
@@ -944,19 +1127,22 @@ async def addcategory_prefix(ctx, *, args: str = None):
         return
 
     await ctx.typing()
-    await bot.loop.run_in_executor(None, db.add_custom_category, slug, label, keyword)
+    await bot.loop.run_in_executor(None, db.add_custom_category, slug, label, keyword, nsfw)
     _invalidate_categories_cache()
     extra = await _maybe_crawl_new_category_now(slug, keyword)
-    await ctx.send(f"✅ Đã thêm chủ đề **{label}** (`{slug}`, từ khóa: `{keyword}`)." + extra)
+    nsfw_note = " 🔞 (đánh dấu NSFW)" if nsfw else ""
+    await ctx.send(f"✅ Đã thêm chủ đề **{label}** (`{slug}`, từ khóa: `{keyword}`){nsfw_note}." + extra)
 
 
-@bot.tree.command(name="editcategory", description="[Admin] Sửa label/keyword của 1 chủ đề đã thêm qua lệnh")
+@bot.tree.command(name="editcategory", description="[Admin] Sửa label/keyword/nsfw của 1 chủ đề đã thêm qua lệnh")
 @app_commands.describe(
     slug="Mã chủ đề cần sửa",
     label="Tên hiển thị mới (bỏ trống nếu giữ nguyên)",
     keyword="Từ khóa Pinterest mới (bỏ trống nếu giữ nguyên)",
+    nsfw="Đánh dấu NSFW? (bỏ trống nếu giữ nguyên)",
 )
-async def editcategory_slash(interaction: discord.Interaction, slug: str, label: str = None, keyword: str = None):
+async def editcategory_slash(interaction: discord.Interaction, slug: str, label: str = None,
+                              keyword: str = None, nsfw: bool = None):
     if not is_admin(interaction.user.id):
         await interaction.response.send_message("⚠️ Chỉ admin mới dùng được lệnh này.", ephemeral=True)
         return
@@ -967,14 +1153,14 @@ async def editcategory_slash(interaction: discord.Interaction, slug: str, label:
             f"⚠️ `{slug}` là chủ đề có sẵn trong code, không sửa được qua lệnh.", ephemeral=True
         )
         return
-    if not label and not keyword:
+    if not label and not keyword and nsfw is None:
         await interaction.response.send_message(
-            "⚠️ Cần cung cấp ít nhất 1 trong 2: label hoặc keyword để sửa.", ephemeral=True
+            "⚠️ Cần cung cấp ít nhất 1 trong 3: label, keyword hoặc nsfw để sửa.", ephemeral=True
         )
         return
 
     await interaction.response.defer(ephemeral=True)
-    ok = await bot.loop.run_in_executor(None, db.edit_custom_category, slug, label, keyword)
+    ok = await bot.loop.run_in_executor(None, db.edit_custom_category, slug, label, keyword, nsfw)
     _invalidate_categories_cache()
     if ok:
         await interaction.followup.send(f"✅ Đã cập nhật chủ đề `{slug}`.")
@@ -982,26 +1168,32 @@ async def editcategory_slash(interaction: discord.Interaction, slug: str, label:
         await interaction.followup.send(f"❌ Không tìm thấy chủ đề `{slug}` (chưa từng thêm qua `/addcategory`).")
 
 
-@bot.command(name="editcategory", help="[Admin] !editcategory slug | Label mới | keyword mới (để trống phần nào nếu giữ nguyên)")
+@bot.command(name="editcategory", help="[Admin] !editcategory slug | Label mới | keyword mới | nsfw mới (để trống phần nào nếu giữ nguyên)")
 async def editcategory_prefix(ctx, *, args: str = None):
     if not is_admin(ctx.author.id):
         await ctx.send("⚠️ Chỉ admin mới dùng được lệnh này.")
         return
-    if not args or args.count("|") != 2:
-        await ctx.send("⚠️ Cú pháp: `!editcategory slug | Label mới | keyword mới` (để trống phần nào nếu muốn giữ nguyên)")
+    if not args or args.count("|") not in (2, 3):
+        await ctx.send("⚠️ Cú pháp: `!editcategory slug | Label mới | keyword mới [| nsfw mới]` (để trống phần nào nếu muốn giữ nguyên)")
         return
 
-    slug, label, keyword = [p.strip() for p in args.split("|")]
+    parts = [p.strip() for p in args.split("|")]
+    slug, label, keyword = parts[0], parts[1], parts[2]
+    nsfw_raw = parts[3] if len(parts) == 4 else ""
+    nsfw = None
+    if nsfw_raw:
+        nsfw = nsfw_raw.lower() in ("nsfw", "true", "1", "có")
+
     slug = slug.lower()
     if slug in CATEGORIES:
         await ctx.send(f"⚠️ `{slug}` là chủ đề có sẵn trong code, không sửa được qua lệnh.")
         return
-    if not label and not keyword:
-        await ctx.send("⚠️ Cần cung cấp ít nhất 1 trong 2: label hoặc keyword để sửa.")
+    if not label and not keyword and nsfw is None:
+        await ctx.send("⚠️ Cần cung cấp ít nhất 1 trong 3: label, keyword hoặc nsfw để sửa.")
         return
 
     await ctx.typing()
-    ok = await bot.loop.run_in_executor(None, db.edit_custom_category, slug, label or None, keyword or None)
+    ok = await bot.loop.run_in_executor(None, db.edit_custom_category, slug, label or None, keyword or None, nsfw)
     _invalidate_categories_cache()
     if ok:
         await ctx.send(f"✅ Đã cập nhật chủ đề `{slug}`.")
@@ -1166,6 +1358,12 @@ async def showcase_slash(interaction: discord.Interaction, chu_de: str, kenh: di
         return
 
     target_channel = kenh or interaction.channel
+    if info.get("nsfw") and not _channel_allows_nsfw(target_channel):
+        await interaction.response.send_message(
+            f"🔞 Chủ đề **{info['label']}** là NSFW, chỉ đăng được vào kênh đã đánh dấu Age-Restricted.",
+            ephemeral=True,
+        )
+        return
     await interaction.response.defer(ephemeral=True)
 
     message, error = await _post_showcase_board(target_channel, chu_de, info, interaction.user.id)
@@ -1189,6 +1387,9 @@ async def showcase_prefix(ctx, chu_de: str = None, kenh: discord.TextChannel = N
     category_key = chu_de.lower()
     info = all_cats[category_key]
     target_channel = kenh or ctx.channel
+    if info.get("nsfw") and not _channel_allows_nsfw(target_channel):
+        await ctx.send(f"🔞 Chủ đề **{info['label']}** là NSFW, chỉ đăng được vào kênh đã đánh dấu Age-Restricted.")
+        return
     await ctx.typing()
 
     message, error = await _post_showcase_board(target_channel, category_key, info, ctx.author.id)
@@ -1230,6 +1431,144 @@ async def favorites_prefix(ctx):
         return await ctx.send(embed=embed, view=view)
 
     await _send_ephemeral_image_list(send_func, f"⭐ Ảnh đã lưu của bạn ({len(urls)} ảnh)", urls, ctx.author.id)
+
+
+# ============================================================
+# Lệnh admin: /config, !config — cấu hình giới hạn kênh/role RIÊNG cho
+# từng server (guild). Nếu server chưa cấu hình gì qua đây, bot dùng
+# ALLOWED_CHANNEL_IDS/ALLOWED_ROLE_IDS từ biến môi trường làm mặc định.
+# ============================================================
+
+def _format_guild_config(cfg: dict) -> str:
+    channels_text = ", ".join(f"<#{c}>" for c in cfg["allowed_channel_ids"]) or "(không giới hạn — dùng được mọi kênh)"
+    roles_text = ", ".join(f"<@&{r}>" for r in cfg["allowed_role_ids"]) or "(không giới hạn — ai cũng dùng được)"
+    return f"**Kênh cho phép:** {channels_text}\n**Role cho phép:** {roles_text}"
+
+
+CONFIG_ACTIONS = [
+    app_commands.Choice(name="Xem cấu hình hiện tại", value="view"),
+    app_commands.Choice(name="Thêm kênh cho phép", value="add_channel"),
+    app_commands.Choice(name="Xoá 1 kênh khỏi danh sách cho phép", value="remove_channel"),
+    app_commands.Choice(name="Xoá hết giới hạn kênh (dùng được mọi kênh)", value="clear_channels"),
+    app_commands.Choice(name="Thêm role cho phép", value="add_role"),
+    app_commands.Choice(name="Xoá 1 role khỏi danh sách cho phép", value="remove_role"),
+    app_commands.Choice(name="Xoá hết giới hạn role (ai cũng dùng được)", value="clear_roles"),
+]
+
+
+@bot.tree.command(name="config", description="[Admin] Cấu hình giới hạn kênh/role dùng lệnh ảnh cho server này")
+@app_commands.describe(action="Hành động", kenh="Kênh (dùng cho add_channel/remove_channel)", role="Role (dùng cho add_role/remove_role)")
+@app_commands.choices(action=CONFIG_ACTIONS)
+async def config_slash(interaction: discord.Interaction, action: app_commands.Choice[str],
+                        kenh: discord.TextChannel = None, role: discord.Role = None):
+    if not is_admin(interaction.user.id):
+        await interaction.response.send_message("⚠️ Chỉ admin mới dùng được lệnh này.", ephemeral=True)
+        return
+    if interaction.guild_id is None:
+        await interaction.response.send_message("⚠️ Lệnh này chỉ dùng được trong server, không dùng được ở DM.", ephemeral=True)
+        return
+
+    guild_id = interaction.guild_id
+    act = action.value
+
+    if act == "view":
+        cfg = await bot.loop.run_in_executor(None, db.get_guild_config, guild_id)
+        await interaction.response.send_message(_format_guild_config(cfg), ephemeral=True)
+        return
+
+    if act in ("add_channel", "remove_channel"):
+        if not kenh:
+            await interaction.response.send_message("⚠️ Cần chọn kênh.", ephemeral=True)
+            return
+        fn = db.add_guild_allowed_channel if act == "add_channel" else db.remove_guild_allowed_channel
+        await bot.loop.run_in_executor(None, fn, guild_id, kenh.id)
+        _invalidate_guild_config_cache(guild_id)
+        verb = "Đã thêm" if act == "add_channel" else "Đã xoá"
+        prep = "vào" if act == "add_channel" else "khỏi"
+        await interaction.response.send_message(f"✅ {verb} {kenh.mention} {prep} danh sách kênh cho phép.", ephemeral=True)
+        return
+
+    if act == "clear_channels":
+        await bot.loop.run_in_executor(None, db.clear_guild_allowed_channels, guild_id)
+        _invalidate_guild_config_cache(guild_id)
+        await interaction.response.send_message("✅ Đã xoá hết giới hạn kênh (dùng được ở mọi kênh).", ephemeral=True)
+        return
+
+    if act in ("add_role", "remove_role"):
+        if not role:
+            await interaction.response.send_message("⚠️ Cần chọn role.", ephemeral=True)
+            return
+        fn = db.add_guild_allowed_role if act == "add_role" else db.remove_guild_allowed_role
+        await bot.loop.run_in_executor(None, fn, guild_id, role.id)
+        _invalidate_guild_config_cache(guild_id)
+        verb = "Đã thêm" if act == "add_role" else "Đã xoá"
+        prep = "vào" if act == "add_role" else "khỏi"
+        await interaction.response.send_message(f"✅ {verb} role {role.mention} {prep} danh sách cho phép.", ephemeral=True)
+        return
+
+    if act == "clear_roles":
+        await bot.loop.run_in_executor(None, db.clear_guild_allowed_roles, guild_id)
+        _invalidate_guild_config_cache(guild_id)
+        await interaction.response.send_message("✅ Đã xoá hết giới hạn role (ai cũng dùng được).", ephemeral=True)
+        return
+
+
+@bot.command(name="config", help="[Admin] !config view | add_channel #kênh | remove_channel #kênh | clear_channels | add_role @role | remove_role @role | clear_roles")
+async def config_prefix(ctx, action: str = None):
+    if not is_admin(ctx.author.id):
+        await ctx.send("⚠️ Chỉ admin mới dùng được lệnh này.")
+        return
+    if ctx.guild is None:
+        await ctx.send("⚠️ Lệnh này chỉ dùng được trong server, không dùng được ở DM.")
+        return
+
+    guild_id = ctx.guild.id
+    action = (action or "view").lower()
+
+    if action == "view":
+        cfg = await bot.loop.run_in_executor(None, db.get_guild_config, guild_id)
+        await ctx.send(_format_guild_config(cfg))
+        return
+
+    if action in ("add_channel", "remove_channel"):
+        if not ctx.message.channel_mentions:
+            await ctx.send(f"⚠️ Cần tag kênh, vd: `!config {action} #anh-vui`")
+            return
+        channel = ctx.message.channel_mentions[0]
+        fn = db.add_guild_allowed_channel if action == "add_channel" else db.remove_guild_allowed_channel
+        await bot.loop.run_in_executor(None, fn, guild_id, channel.id)
+        _invalidate_guild_config_cache(guild_id)
+        verb = "Đã thêm" if action == "add_channel" else "Đã xoá"
+        prep = "vào" if action == "add_channel" else "khỏi"
+        await ctx.send(f"✅ {verb} {channel.mention} {prep} danh sách kênh cho phép.")
+        return
+
+    if action == "clear_channels":
+        await bot.loop.run_in_executor(None, db.clear_guild_allowed_channels, guild_id)
+        _invalidate_guild_config_cache(guild_id)
+        await ctx.send("✅ Đã xoá hết giới hạn kênh.")
+        return
+
+    if action in ("add_role", "remove_role"):
+        if not ctx.message.role_mentions:
+            await ctx.send(f"⚠️ Cần tag role, vd: `!config {action} @Member`")
+            return
+        role_obj = ctx.message.role_mentions[0]
+        fn = db.add_guild_allowed_role if action == "add_role" else db.remove_guild_allowed_role
+        await bot.loop.run_in_executor(None, fn, guild_id, role_obj.id)
+        _invalidate_guild_config_cache(guild_id)
+        verb = "Đã thêm" if action == "add_role" else "Đã xoá"
+        prep = "vào" if action == "add_role" else "khỏi"
+        await ctx.send(f"✅ {verb} role {role_obj.mention} {prep} danh sách cho phép.")
+        return
+
+    if action == "clear_roles":
+        await bot.loop.run_in_executor(None, db.clear_guild_allowed_roles, guild_id)
+        _invalidate_guild_config_cache(guild_id)
+        await ctx.send("✅ Đã xoá hết giới hạn role.")
+        return
+
+    await ctx.send("⚠️ Hành động không hợp lệ. Dùng: `view | add_channel | remove_channel | clear_channels | add_role | remove_role | clear_roles`")
 
 
 TOKEN = os.getenv("DISCORD_TOKEN")

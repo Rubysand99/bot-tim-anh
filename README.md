@@ -27,13 +27,17 @@ lưu vào MongoDB, có fallback cào trực tiếp khi DB hết ảnh khả dụ
 - **`bot.py`** — bot Discord, deploy trên Render (xem `procfile`). Lệnh `/img`
   lấy ảnh NGẪU NHIÊN trong category đã chọn từ MongoDB (không theo thứ tự),
   chỉ fallback cào Pinterest trực tiếp khi category đó hết ảnh khả dụng
-  trong DB. Nút Trước/Sau trong embed hoạt động vĩnh viễn (không hết hạn, kể
+  trong DB — có circuit breaker tự tạm ngừng fallback nếu Pinterest thất bại
+  liên tiếp. Nút Trước/Sau trong embed hoạt động vĩnh viễn (không hết hạn, kể
   cả sau khi bot restart) vì trạng thái được lưu trong MongoDB thay vì RAM.
-  Có cooldown, giới hạn kênh/role (tuỳ chọn), và lệnh quản trị dành riêng
-  cho admin.
+  Có cooldown, giới hạn kênh/role theo từng server (`/config`), category có
+  thể gắn cờ NSFW (chỉ dùng được ở kênh Age-Restricted), và lệnh quản trị
+  dành riêng cho admin.
 - **`db.py`** — kết nối MongoDB dùng chung cho cả `crawl_job.py` và `bot.py`.
-  Có category tuỳ chỉnh (`custom_categories`), phiên xem ảnh bền vững
-  (`paginator_sessions`), metadata thời điểm crawl gần nhất (`meta`).
+  Có category tuỳ chỉnh (`custom_categories`, có field `nsfw`), phiên xem
+  ảnh bền vững (`paginator_sessions`), ảnh yêu thích (`favorites`), cấu hình
+  riêng theo server (`guild_configs`), metadata thời điểm crawl gần nhất
+  (`meta`).
 - **`pinterest_crawler.py`** — logic cào Pinterest (dùng endpoint nội bộ,
   không chính thức — xem cảnh báo trong docstring của file).
 - **`keep_alive.py`** — mở 1 server Flask nhỏ để giữ bot "thức" trên các nền
@@ -56,8 +60,8 @@ pip install -r requirements.txt
 | `MONGO_URI` | `bot.py` (Render) **và** GitHub Actions Secret | Connection string MongoDB Atlas |
 | `PORT` | `keep_alive.py` (Render tự cấp) | Port cho server Flask giữ bot thức |
 | `ADMIN_USER_IDS` | `bot.py` (Render), tuỳ chọn | Danh sách Discord user ID admin, cách nhau bởi dấu phẩy. Mặc định sẵn 1 admin (`846332174734983219`) kể cả khi không set biến này. Admin bỏ qua cooldown + giới hạn kênh/role, và dùng được `/addcategory`, `/removecategory`, `/cleanup`. |
-| `ALLOWED_CHANNEL_IDS` | `bot.py` (Render), tuỳ chọn | Nếu set, lệnh ảnh (`/img`, `!img`, `/random`, `!random`) chỉ dùng được ở các kênh này (ID, cách nhau bởi dấu phẩy). Để trống = không giới hạn kênh. Admin luôn bypass. |
-| `ALLOWED_ROLE_IDS` | `bot.py` (Render), tuỳ chọn | Nếu set, chỉ member có 1 trong các role này mới dùng được lệnh ảnh (ID, cách nhau bởi dấu phẩy). Để trống = không giới hạn role. Admin luôn bypass. |
+| `ALLOWED_CHANNEL_IDS` | `bot.py` (Render), tuỳ chọn | **Mặc định toàn cục** khi 1 server chưa dùng `/config` để tự đặt riêng. Nếu set, lệnh ảnh chỉ dùng được ở các kênh này (ID, cách nhau bởi dấu phẩy). Để trống = không giới hạn kênh. Admin luôn bypass. |
+| `ALLOWED_ROLE_IDS` | `bot.py` (Render), tuỳ chọn | **Mặc định toàn cục**, tương tự trên nhưng cho role. Server nào đã tự cấu hình qua `/config` thì dùng cấu hình riêng, bỏ qua biến này. |
 | `DISCORD_WEBHOOK_URL` | `crawl_job.py` (GitHub Actions Secret), tuỳ chọn | Webhook Discord để nhận cảnh báo khi crawl lỗi toàn bộ hoặc 1 category sắp cạn ảnh. Bỏ trống thì chỉ ghi log, không gửi cảnh báo. |
 | `LOG_CHANNEL_ID` | `bot.py` (Render), tuỳ chọn | ID kênh Discord nhận log lỗi tự động (mọi `logger.warning`/`logger.error` trong bot) + heartbeat ping mỗi 10 phút. Bỏ trống = tắt tính năng này, chỉ log ra Render logs như trước. |
 
@@ -105,23 +109,28 @@ hay sau khi bot restart, vì trạng thái phiên xem ảnh được lưu trong 
 
 | Lệnh | Loại | Mô tả |
 |---|---|---|
-| `/addcategory <slug> <label> <keyword>` | Slash | Thêm chủ đề mới, có hiệu lực ngay. Tự crawl ngay chủ đề này nếu lần crawl định kỳ gần nhất đã ≥ 1 tiếng trước |
-| `!addcategory slug \| Label \| keyword` | Prefix | Tương tự, cú pháp phân cách bằng `\|` vì label/keyword có thể có khoảng trắng |
-| `/editcategory <slug> [label] [keyword]` | Slash | Sửa label/keyword của chủ đề đã thêm qua `/addcategory` (bỏ trống phần nào để giữ nguyên) |
-| `!editcategory slug \| Label mới \| keyword mới` | Prefix | Tương tự, để trống phần nào (giữa 2 dấu `\|`) để giữ nguyên |
+| `/addcategory <slug> <label> <keyword> [nsfw]` | Slash | Thêm chủ đề mới, có hiệu lực ngay. `nsfw` mặc định Không. Tự crawl ngay chủ đề này nếu lần crawl định kỳ gần nhất đã ≥ 1 tiếng trước |
+| `!addcategory slug \| Label \| keyword [\| nsfw]` | Prefix | Tương tự, cú pháp phân cách bằng `\|`. Thêm `\| nsfw` ở cuối để đánh dấu NSFW |
+| `/editcategory <slug> [label] [keyword] [nsfw]` | Slash | Sửa label/keyword/nsfw của chủ đề đã thêm qua `/addcategory` (bỏ trống phần nào để giữ nguyên) |
+| `!editcategory slug \| Label mới \| keyword mới [\| nsfw mới]` | Prefix | Tương tự, để trống phần nào (giữa 2 dấu `\|`) để giữ nguyên |
 | `/removecategory <slug>` | Slash | Xoá chủ đề đã thêm qua `/addcategory` (không xoá được category tĩnh trong `categories.py`) |
 | `!removecategory <slug>` | Prefix | Tương tự |
 | `/cleanup <chủ_đề>` | Slash | Dọn ảnh lỗi link (404...) và ảnh đã gửi ≥ 20 lần trong 1 chủ đề |
 | `!cleanup <chủ_đề>` | Prefix | Tương tự |
-| `/showcase <chủ_đề> [kênh]` | Slash | Đăng "bảng giới thiệu" 1 chủ đề vào kênh: ảnh mẫu + tag admin + nút "🎲 Bắt đầu" cho mọi người bấm |
+| `/showcase <chủ_đề> [kênh]` | Slash | Đăng "bảng giới thiệu" 1 chủ đề vào kênh: ảnh mẫu + tag admin + nút "🎲 Bắt đầu" cho mọi người bấm. Chặn nếu chủ đề là NSFW mà kênh không phải Age-Restricted |
 | `!showcase <chủ_đề> [#kênh]` | Prefix | Tương tự, kênh bỏ trống = kênh hiện tại |
+| `/config <action> [kênh] [role]` | Slash | Cấu hình giới hạn kênh/role dùng lệnh ảnh **riêng cho server này** (xem mục "Cấu hình riêng theo server" bên dưới) |
+| `!config <action> [#kênh/@role]` | Prefix | Tương tự |
 
 ### Lệnh cho mọi người
 
 | Lệnh | Loại | Mô tả |
 |---|---|---|
-| `/favorites` | Slash | Xem lại các ảnh đã lưu qua nút 💾 Lưu ảnh |
+| `/favorites` | Slash | Xem lại các ảnh đã lưu. Khi xem ở đây, nút 💾 đổi thành 🗑️ **Xoá khỏi yêu thích** |
 | `!favorites` | Prefix | Tương tự |
+
+Giới hạn tối đa **100 ảnh yêu thích/người** — lưu thêm khi đã đầy sẽ báo lỗi,
+cần xoá bớt qua `/favorites` trước.
 
 ## Showcase board — bảng giới thiệu chủ đề
 
@@ -153,6 +162,47 @@ Nút "Bắt đầu" trên showcase board hoạt động vĩnh viễn giống nú
 
 Lưu ý: Discord autocomplete giới hạn tối đa 25 gợi ý hiển thị cùng lúc (gõ để
 lọc bớt nếu có nhiều hơn 25 category).
+
+## Cấu hình riêng theo server (`/config`)
+
+Nếu bot có mặt ở nhiều server, mỗi server có thể tự đặt giới hạn kênh/role
+riêng bằng `/config`, không ảnh hưởng tới server khác:
+
+| Action | Mô tả |
+|---|---|
+| `view` | Xem cấu hình hiện tại của server này |
+| `add_channel` / `remove_channel` | Thêm/xoá 1 kênh khỏi danh sách cho phép |
+| `clear_channels` | Xoá hết giới hạn kênh (dùng được ở mọi kênh) |
+| `add_role` / `remove_role` | Thêm/xoá 1 role khỏi danh sách cho phép |
+| `clear_roles` | Xoá hết giới hạn role (ai cũng dùng được) |
+
+Server nào **chưa từng dùng `/config`** sẽ dùng `ALLOWED_CHANNEL_IDS`/
+`ALLOWED_ROLE_IDS` từ biến môi trường Render làm mặc định (giữ tương thích
+ngược). Ngay khi server đó chạy `/config add_channel` hoặc `add_role` lần
+đầu, cấu hình riêng của server sẽ thay thế hoàn toàn mặc định toàn cục cho
+server đó — các server khác không bị ảnh hưởng.
+
+## Chủ đề NSFW
+
+Category có thể đánh dấu `nsfw: True` (qua `/addcategory`/`/editcategory`,
+hoặc sửa trực tiếp `categories.py`). Category NSFW:
+- Không xuất hiện trong kết quả `/random`/`!random` nếu kênh gọi lệnh chưa
+  được Discord đánh dấu **Age-Restricted**.
+- `/img`, `!img` và `/showcase`, `!showcase` từ chối phục vụ/đăng category
+  NSFW ở kênh không phải Age-Restricted.
+- Nút "Bắt đầu" trên showcase board kiểm tra lại NSFW ngay lúc bấm (không
+  chỉ lúc đăng board), phòng trường hợp kênh bị đổi trạng thái NSFW sau đó.
+
+Tất cả category có sẵn trong `categories.py` hiện đang để `nsfw: False` mặc
+định — tự sửa lại `True` cho category nào bạn thấy cần giới hạn kênh.
+
+## Circuit breaker cho fallback Pinterest
+
+Nếu fallback cào Pinterest thất bại liên tiếp 3 lần (dấu hiệu Pinterest
+đang chặn IP hoặc lỗi diện rộng), bot tự "ngắt mạch" — tạm ngừng thử fallback
+trong 5 phút, trả lời ngay "hết ảnh khả dụng" thay vì bắt người dùng chờ hết
+timeout mỗi lần. Sau 5 phút tự thử lại bình thường. Trạng thái này được log
+(và gửi vào `LOG_CHANNEL_ID` nếu bật) khi circuit mở.
 
 ## Giám sát
 
