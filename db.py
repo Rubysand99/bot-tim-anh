@@ -395,3 +395,22 @@ def clear_guild_allowed_roles(guild_id: int) -> None:
     db[GUILD_CONFIGS_COLLECTION].update_one(
         {"_id": guild_id}, {"$set": {"allowed_role_ids": []}}, upsert=True
     )
+
+
+# ============================================================
+# Category kênh (Discord Channel Category / "nhóm kênh") dùng để chứa các
+# kênh text được /setup tạo mới — lưu ID lại theo guild để lần sau tái sử
+# dụng, không tạo trùng nhiều category kênh mỗi lần chạy /setup.
+# ============================================================
+
+def get_guild_setup_category_id(guild_id: int):
+    db = get_db()
+    doc = db[GUILD_CONFIGS_COLLECTION].find_one({"_id": guild_id})
+    return doc.get("setup_category_id") if doc else None
+
+
+def set_guild_setup_category_id(guild_id: int, category_id: int) -> None:
+    db = get_db()
+    db[GUILD_CONFIGS_COLLECTION].update_one(
+        {"_id": guild_id}, {"$set": {"setup_category_id": category_id}}, upsert=True
+    )

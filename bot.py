@@ -1463,6 +1463,43 @@ async def config_prefix(ctx, action: str = None):
 # đúng kênh tương ứng khi đủ thông tin.
 # ============================================================
 
+# Tên category kênh (nhóm kênh trong sidebar Discord) dùng để chứa các kênh
+# text được /setup tự tạo mới. Chỉ tạo 1 lần cho mỗi server, các lần chạy
+# /setup sau tái sử dụng lại — đổi tên ở đây nếu muốn.
+SETUP_CHANNEL_CATEGORY_NAME = "📸 Ảnh chủ đề"
+
+
+async def _ensure_setup_channel_category(guild: discord.Guild):
+    """
+    Trả về (category_channel, error_message). category_channel là None nếu
+    lỗi (error_message sẽ có nội dung), ngược lại error_message rỗng.
+    Ưu tiên tái sử dụng category đã lưu ID trong DB; nếu ID đó không còn hợp
+    lệ (bị xoá thủ công...), thử tìm lại theo tên trước khi tạo mới hẳn —
+    tránh tạo trùng nhiều category kênh cùng tên qua nhiều lần chạy /setup.
+    """
+    stored_id = await bot.loop.run_in_executor(None, db.get_guild_setup_category_id, guild.id)
+    if stored_id:
+        existing = guild.get_channel(stored_id)
+        if isinstance(existing, discord.CategoryChannel):
+            return existing, ""
+
+    for cat in guild.categories:
+        if cat.name == SETUP_CHANNEL_CATEGORY_NAME:
+            await bot.loop.run_in_executor(None, db.set_guild_setup_category_id, guild.id, cat.id)
+            return cat, ""
+
+    try:
+        new_category = await guild.create_category(name=SETUP_CHANNEL_CATEGORY_NAME)
+    except discord.Forbidden:
+        return None, "❌ Bot không có quyền tạo category kênh (cần quyền **Manage Channels**)."
+    except Exception as e:
+        logger.warning(f"Lỗi tạo category kênh trong /setup: {e}")
+        return None, f"❌ Lỗi khi tạo category kênh: {e}"
+
+    await bot.loop.run_in_executor(None, db.set_guild_setup_category_id, guild.id, new_category.id)
+    return new_category, ""
+
+
 class ChannelAssignWizard:
     """Trạng thái đi qua từng chủ đề đã chọn, hỏi gán kênh, rồi đăng showcase board."""
 
@@ -1532,8 +1569,8 @@ class NewChannelModal(discord.ui.Modal):
         self.category_key = category_key
         self.channel_name_input = discord.ui.TextInput(
             label="Tên kênh mới",
-            placeholder=f"vd: {category_key}",
-            default=category_key,
+            placeholder=f"vd: {info['label']}",
+            default=info["label"][:90],
             max_length=90,
         )
         self.add_item(self.channel_name_input)
@@ -1543,8 +1580,14 @@ class NewChannelModal(discord.ui.Modal):
         if not name:
             await interaction.response.send_message("⚠️ Tên kênh không hợp lệ.", ephemeral=True)
             return
+
+        # Gom kênh mới vào 1 category kênh chung (tạo sẵn/tái sử dụng theo
+        # server) thay vì thả nổi ở ngoài — không chặn tạo kênh nếu lỗi,
+        # chỉ báo cho admin biết để tự sắp xếp lại thủ công nếu cần.
+        setup_category, cat_error = await _ensure_setup_channel_category(interaction.guild)
+
         try:
-            new_channel = await interaction.guild.create_text_channel(name=name)
+            new_channel = await interaction.guild.create_text_channel(name=name, category=setup_category)
         except discord.Forbidden:
             await interaction.response.send_message("❌ Bot không có quyền tạo kênh trong server này.", ephemeral=True)
             return
@@ -1552,6 +1595,9 @@ class NewChannelModal(discord.ui.Modal):
             logger.warning(f"Lỗi tạo kênh mới trong /setup: {e}")
             await interaction.response.send_message(f"❌ Lỗi khi tạo kênh: {e}", ephemeral=True)
             return
+
+        if cat_error:
+            logger.warning(f"/setup tạo kênh #{new_channel.name} ngoài category kênh chung: {cat_error}")
 
         await self.wizard.advance(interaction, new_channel)
 

@@ -150,17 +150,24 @@ chủ đề cùng lúc theo 2 bước:
    cho phép chọn nhiều chủ đề cùng lúc hoặc bấm **"✅ Chọn tất cả"**.
 2. **Gán kênh cho từng chủ đề:** bot lần lượt hỏi từng chủ đề đã chọn —
    chọn 1 kênh có sẵn từ dropdown kênh, hoặc bấm **"➕ Tạo kênh mới"** (mở
-   form nhập tên, bot tự tạo kênh text mới trong server).
+   form nhập tên, đã điền sẵn tên chủ đề — sửa lại tuỳ ý trước khi tạo).
+   Kênh mới tạo được gom vào 1 category kênh chung tên **"📸 Ảnh chủ đề"**
+   (tự tạo lần đầu, các lần `/setup` sau tái sử dụng lại category này thay
+   vì tạo trùng — đổi tên category ở constant `SETUP_CHANNEL_CATEGORY_NAME`
+   trong `bot.py` nếu muốn).
 
 Sau khi gán đủ kênh cho tất cả chủ đề đã chọn, bot tự động đăng showcase
 board (giống `/showcase`) vào đúng kênh tương ứng cho từng chủ đề, rồi báo
 kết quả tổng kết. Chủ đề NSFW mà bạn gán vào kênh không phải Age-Restricted
 sẽ tự động bị bỏ qua (có ghi rõ lý do trong kết quả).
 
-**Lưu ý quyền:** để dùng được "➕ Tạo kênh mới", bot cần quyền **Manage
-Channels** trong server (Server Settings → Roles → role của bot → bật
-"Manage Channels"). Thiếu quyền này, bot vẫn dùng được phần chọn kênh có
-sẵn bình thường, chỉ riêng nút tạo kênh mới sẽ báo lỗi.
+**Lưu ý quyền:** để dùng được "➕ Tạo kênh mới" (và tự tạo category kênh
+"📸 Ảnh chủ đề" lần đầu), bot cần quyền **Manage Channels** trong server
+(Server Settings → Roles → role của bot → bật "Manage Channels"). Thiếu
+quyền này, bot vẫn dùng được phần chọn kênh có sẵn bình thường; riêng nút
+tạo kênh mới sẽ báo lỗi, hoặc nếu tạo được kênh nhưng không tạo được
+category thì kênh vẫn được tạo bình thường (chỉ là nằm ngoài category,
+không nằm trong nhóm).
 
 ## Thêm/sửa chủ đề (category)
 
