@@ -444,29 +444,6 @@ async def _fetch_next_image_url(category_key: str, keyword: str, exclude_urls: l
     return url
 
 
-
-def _try_get_image_info(url: str):
-    """
-    Lấy nhanh định dạng + dung lượng ảnh qua HEAD request (không tải cả ảnh).
-    Trả về chuỗi mô tả, hoặc None nếu không lấy được (không coi là lỗi —
-    chỗ gọi hàm này sẽ tự dùng ghi chú thường nếu trả về None).
-    """
-    try:
-        resp = requests.head(url, timeout=4, allow_redirects=True)
-        content_type = resp.headers.get("Content-Type", "")
-        content_length = resp.headers.get("Content-Length")
-
-        parts = []
-        if content_type:
-            parts.append(content_type)
-        if content_length and content_length.isdigit():
-            size_kb = int(content_length) / 1024
-            parts.append(f"{size_kb / 1024:.1f} MB" if size_kb >= 1024 else f"{size_kb:.0f} KB")
-        return " · ".join(parts) if parts else None
-    except Exception:
-        return None
-
-
 def _build_image_embed(label: str, url: str) -> discord.Embed:
     embed = discord.Embed(title=f"🖼️ {label}", color=discord.Color.red())
     embed.set_image(url=url)
@@ -474,28 +451,25 @@ def _build_image_embed(label: str, url: str) -> discord.Embed:
     return embed
 
 
-async def _send_image_result(send_func, category_key: str, label: str, keyword: str, url: str, author_id: int):
+async def _send_image_result(send_func, category_key: str, label: str, keyword: str, url: str, author_id: int, view=None):
     """
     send_func: async callable(embed, view) -> discord.Message
     Gửi ảnh + lưu phiên xem (paginator session) vào MongoDB theo message.id,
     để nút Trước/Sau hoạt động vĩnh viễn (không phụ thuộc RAM của bot).
+    view: mặc định PAGINATOR_VIEW (2 nút công khai); truyền EPHEMERAL_PAGINATOR_VIEW
+    (3 nút, có Lưu ảnh) khi gửi qua showcase board.
     """
+    if view is None:
+        view = PAGINATOR_VIEW
     embed = _build_image_embed(label, url)
-    message = await send_func(embed=embed, view=PAGINATOR_VIEW)
+    message = await send_func(embed=embed, view=view)
     await bot.loop.run_in_executor(
         None, db.save_paginator_session, str(message.id), category_key, label, keyword, [url], 0, author_id
     )
 
 
-MAX_FAVORITES_PER_USER = 100
-
-
 async def _paginator_navigate(interaction: discord.Interaction, direction: int, view: discord.ui.View):
-    """
-    Logic điều hướng dùng chung cho cả PersistentImagePaginator (nút Trước/Sau
-    công khai của /img, /random) và EphemeralImagePaginator (phiên xem riêng
-    tư sau khi bấm "Bắt đầu" ở showcase board).
-    """
+    """Logic điều hướng dùng chung cho mọi nơi hiển thị ảnh có nút Trước/Sau (/img, /random, showcase)."""
     message_id = str(interaction.message.id)
     session = await bot.loop.run_in_executor(None, db.get_paginator_session, message_id)
 
@@ -514,14 +488,6 @@ async def _paginator_navigate(interaction: discord.Interaction, direction: int, 
     images = session["images"]
     index = session["index"]
 
-    # Chuẩn hoá lại view theo DỮ LIỆU SESSION (không phụ thuộc instance nào
-    # đang xử lý callback này) — quan trọng vì sau khi bot restart, Discord
-    # có thể route interaction qua bất kỳ instance đã đăng ký persistent nào
-    # có cùng custom_id, không nhất thiết là instance có nhãn nút đúng ngữ
-    # cảnh. Chỉ áp dụng cho họ EphemeralImagePaginator (có nút Lưu/Xoá).
-    if isinstance(view, EphemeralImagePaginator) and session.get("category_key") == "":
-        view = FAVORITES_PAGINATOR_VIEW
-
     if direction < 0:
         index = max(0, index - 1)
         await bot.loop.run_in_executor(None, db.update_paginator_session, message_id, images, index)
@@ -533,11 +499,6 @@ async def _paginator_navigate(interaction: discord.Interaction, direction: int, 
         index += 1
         await bot.loop.run_in_executor(None, db.update_paginator_session, message_id, images, index)
         await interaction.response.edit_message(embed=_build_image_embed(session["label"], images[index]), view=view)
-        return
-
-    # Danh sách hữu hạn (vd: favorites, keyword rỗng) -> không có gì để fetch thêm
-    if not session.get("keyword"):
-        await interaction.response.send_message("📭 Đã hết ảnh trong danh sách này.", ephemeral=True)
         return
 
     # Hết ảnh đệm -> lấy ảnh mới (DB hoặc fallback Pinterest), có thể mất vài giây
@@ -578,22 +539,42 @@ class PersistentImagePaginator(discord.ui.View):
 PAGINATOR_VIEW = PersistentImagePaginator()
 
 
+def _try_get_image_info(url: str):
+    """
+    Lấy nhanh định dạng + dung lượng ảnh qua HEAD request (không tải cả ảnh).
+    Trả về chuỗi mô tả, hoặc None nếu không lấy được (không coi là lỗi —
+    chỗ gọi hàm này sẽ tự dùng ghi chú thường nếu trả về None).
+    """
+    try:
+        resp = requests.head(url, timeout=4, allow_redirects=True)
+        content_type = resp.headers.get("Content-Type", "")
+        content_length = resp.headers.get("Content-Length")
+
+        parts = []
+        if content_type:
+            parts.append(content_type)
+        if content_length and content_length.isdigit():
+            size_kb = int(content_length) / 1024
+            parts.append(f"{size_kb / 1024:.1f} MB" if size_kb >= 1024 else f"{size_kb:.0f} KB")
+        return " · ".join(parts) if parts else None
+    except Exception:
+        return None
+
+
 class EphemeralImagePaginator(discord.ui.View):
     """
     Giống PersistentImagePaginator nhưng có thêm nút "💾 Lưu ảnh" — dùng cho
     phiên xem riêng tư (ephemeral) mở ra sau khi bấm "Bắt đầu" ở showcase
-    board, hoặc khi xem lại /favorites. custom_id khác PAGINATOR_VIEW để
-    Discord phân biệt được 2 view khi cùng đăng ký persistent.
+    board. custom_id khác PAGINATOR_VIEW để Discord phân biệt được 2 view
+    khi cùng đăng ký persistent.
 
-    save_button_label/style tuỳ biến được vì cùng 1 nút này đóng 2 vai trò
-    khác nhau tuỳ ngữ cảnh: "Lưu ảnh" khi xem qua showcase, "Xoá khỏi yêu
-    thích" khi xem qua /favorites (xem FAVORITES_PAGINATOR_VIEW bên dưới).
+    "Lưu ảnh" = bot gửi ảnh qua tin nhắn riêng (DM) cho người bấm kèm ghi
+    chú (có thêm định dạng/dung lượng nếu lấy được). Không lưu vào DB, không
+    có danh sách xem lại — chỉ đơn thuần gửi DM ngay lúc đó.
     """
 
-    def __init__(self, save_button_label: str = "💾 Lưu ảnh", save_button_style: discord.ButtonStyle = discord.ButtonStyle.success):
+    def __init__(self):
         super().__init__(timeout=None)
-        self.save_button.label = save_button_label
-        self.save_button.style = save_button_style
 
     @discord.ui.button(label="◀", style=discord.ButtonStyle.secondary, custom_id="epaginator:prev")
     async def previous_button(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -611,47 +592,18 @@ class EphemeralImagePaginator(discord.ui.View):
             await interaction.response.send_message("⚠️ Không tìm thấy dữ liệu ảnh này nữa.", ephemeral=True)
             return
         if interaction.user.id != session["author_id"]:
-            await interaction.response.send_message("⚠️ Bạn không thể thao tác trên phiên của người khác.", ephemeral=True)
+            await interaction.response.send_message("⚠️ Bạn không thể lưu ảnh của người khác.", ephemeral=True)
             return
 
         url = session["images"][session["index"]]
-
-        # Đang xem qua /favorites (category_key rỗng là dấu hiệu nhận biết) ->
-        # nút này đổi vai trò thành "Xoá khỏi yêu thích" vì ảnh đang xem chắc
-        # chắn đã có sẵn trong favorites rồi, "lưu lại" không có ý nghĩa gì.
-        if session["category_key"] == "":
-            await self._remove_from_favorites(interaction, session, message_id, url)
-            return
-
-        await self._add_to_favorites(interaction, session, url)
-
-    async def _add_to_favorites(self, interaction: discord.Interaction, session: dict, url: str):
         label = session["label"]
         await interaction.response.defer(ephemeral=True)
-
-        current_count = await bot.loop.run_in_executor(None, db.count_favorites, interaction.user.id)
-        if current_count >= MAX_FAVORITES_PER_USER:
-            await interaction.followup.send(
-                f"⚠️ Bạn đã lưu tối đa **{MAX_FAVORITES_PER_USER}** ảnh yêu thích rồi. "
-                f"Dùng `/favorites` rồi bấm 🗑️ để xoá bớt trước khi lưu thêm.",
-                ephemeral=True,
-            )
-            return
-
-        saved = await bot.loop.run_in_executor(
-            None, db.add_favorite, interaction.user.id, session["category_key"], url
-        )
-        note = (
-            "Đã lưu vào danh sách yêu thích của bạn (xem lại bằng `/favorites`)."
-            if saved else
-            "Ảnh này bạn đã lưu từ trước rồi (đã có trong `/favorites`)."
-        )
 
         # Cố gắng lấy thêm thông tin ảnh (định dạng, dung lượng) qua HEAD request.
         # Không bắt buộc phải thành công — nếu lỗi/timeout thì bỏ qua, chỉ dùng ghi chú thường.
         info_text = await bot.loop.run_in_executor(None, _try_get_image_info, url)
 
-        dm_embed = discord.Embed(title=f"💾 Ảnh đã lưu — {label}", description=f"✅ {note}", color=discord.Color.green())
+        dm_embed = discord.Embed(title=f"💾 Ảnh đã lưu — {label}", description="✅ Gửi theo yêu cầu lưu ảnh của bạn.", color=discord.Color.green())
         dm_embed.set_image(url=url)
         if info_text:
             dm_embed.add_field(name="Thông tin ảnh", value=info_text, inline=False)
@@ -669,14 +621,14 @@ class EphemeralImagePaginator(discord.ui.View):
             dm_error_text = f"Lỗi không xác định khi gửi tin nhắn riêng: {e}"
 
         if dm_ok:
-            await interaction.followup.send("✅ Đã lưu và gửi ảnh vào tin nhắn riêng (DM) của bạn.", ephemeral=True)
+            await interaction.followup.send("✅ Đã gửi ảnh vào tin nhắn riêng (DM) của bạn.", ephemeral=True)
             return
 
         logger.warning(f"Không gửi được DM lưu ảnh cho user {interaction.user.id}: {dm_error_text}")
 
         fail_embed = discord.Embed(
-            title="⚠️ Đã lưu ảnh, nhưng không gửi được tin nhắn riêng (DM)",
-            description=f"{note}\n\n**Lý do không gửi được DM:** {dm_error_text}",
+            title="⚠️ Không gửi được tin nhắn riêng (DM)",
+            description=f"**Lý do:** {dm_error_text}",
             color=discord.Color.orange(),
         )
         fail_embed.set_image(url=url)
@@ -684,68 +636,8 @@ class EphemeralImagePaginator(discord.ui.View):
             fail_embed.add_field(name="Thông tin ảnh", value=info_text, inline=False)
         await interaction.followup.send(embed=fail_embed, ephemeral=True)
 
-    async def _remove_from_favorites(self, interaction: discord.Interaction, session: dict, message_id: str, url: str):
-        removed = await bot.loop.run_in_executor(None, db.remove_favorite, interaction.user.id, url)
-        if not removed:
-            await interaction.response.send_message(
-                "ℹ️ Ảnh này không có trong danh sách yêu thích (có thể đã bị xoá từ trước).", ephemeral=True
-            )
-            return
-
-        images = list(session["images"])
-        index = session["index"]
-        images.pop(index)
-
-        if not images:
-            await bot.loop.run_in_executor(None, db.update_paginator_session, message_id, [], 0)
-            empty_embed = discord.Embed(
-                title="⭐ Ảnh đã lưu của bạn",
-                description="📭 Danh sách yêu thích hiện đang trống.",
-                color=discord.Color.blurple(),
-            )
-            await interaction.response.edit_message(embed=empty_embed, view=None)
-            return
-
-        index = min(index, len(images) - 1)
-        await bot.loop.run_in_executor(None, db.update_paginator_session, message_id, images, index)
-        await interaction.response.edit_message(
-            embed=_build_image_embed(session["label"], images[index]), view=FAVORITES_PAGINATOR_VIEW
-        )
-
 
 EPHEMERAL_PAGINATOR_VIEW = EphemeralImagePaginator()
-
-# Bản riêng cho /favorites — cùng custom_id (nên không cần bot.add_view()
-# đăng ký thêm, dispatch vẫn tự route qua EPHEMERAL_PAGINATOR_VIEW đã đăng
-# ký), chỉ khác nhãn/màu nút "Lưu ảnh" -> "Xoá khỏi yêu thích" cho đúng ngữ
-# cảnh khi gửi tin nhắn lần đầu.
-FAVORITES_PAGINATOR_VIEW = EphemeralImagePaginator(
-    save_button_label="🗑️ Xoá khỏi yêu thích", save_button_style=discord.ButtonStyle.danger
-)
-
-
-async def _send_ephemeral_image_result(send_func, category_key: str, label: str, keyword: str, url: str, author_id: int):
-    """Giống _send_image_result nhưng dùng EPHEMERAL_PAGINATOR_VIEW (3 nút, có Lưu ảnh)."""
-    embed = _build_image_embed(label, url)
-    message = await send_func(embed=embed, view=EPHEMERAL_PAGINATOR_VIEW)
-    await bot.loop.run_in_executor(
-        None, db.save_paginator_session, str(message.id), category_key, label, keyword, [url], 0, author_id
-    )
-
-
-async def _send_ephemeral_image_list(send_func, label: str, images: list, author_id: int):
-    """
-    Giống _send_ephemeral_image_result nhưng nạp sẵn TOÀN BỘ danh sách ảnh
-    (không phải 1 ảnh rồi fetch thêm dần) — dùng cho /favorites, vì đây là
-    danh sách hữu hạn có sẵn, không cần gọi DB lại mỗi lần bấm Sau/Trước.
-    keyword để trống ("") để _paginator_navigate biết đây là danh sách hữu
-    hạn, không cố fetch thêm khi hết.
-    """
-    embed = _build_image_embed(label, images[0])
-    message = await send_func(embed=embed, view=FAVORITES_PAGINATOR_VIEW)
-    await bot.loop.run_in_executor(
-        None, db.save_paginator_session, str(message.id), "", label, "", images, 0, author_id
-    )
 
 
 class ShowcaseStartView(discord.ui.View):
@@ -800,9 +692,12 @@ class ShowcaseStartView(discord.ui.View):
             return
 
         async def send_func(embed, view):
-            return await interaction.followup.send(embed=embed, view=view, wait=True)
+            return await interaction.followup.send(embed=embed, view=view, ephemeral=True, wait=True)
 
-        await _send_ephemeral_image_result(send_func, category_key, info["label"], info["keyword"], url, interaction.user.id)
+        await _send_image_result(
+            send_func, category_key, info["label"], info["keyword"], url, interaction.user.id,
+            view=EPHEMERAL_PAGINATOR_VIEW,
+        )
 
 
 SHOWCASE_VIEW = ShowcaseStartView()
@@ -1400,40 +1295,6 @@ async def showcase_prefix(ctx, chu_de: str = None, kenh: discord.TextChannel = N
 
 
 # ============================================================
-# Lệnh /favorites, !favorites — xem lại ảnh đã lưu qua nút "💾 Lưu ảnh"
-# ============================================================
-
-@bot.tree.command(name="favorites", description="Xem lại các ảnh bạn đã lưu")
-async def favorites_slash(interaction: discord.Interaction):
-    await interaction.response.defer(ephemeral=True)
-    urls = await bot.loop.run_in_executor(None, db.get_favorites, interaction.user.id)
-    if not urls:
-        await interaction.followup.send(
-            "📭 Bạn chưa lưu ảnh nào. Bấm nút 💾 Lưu ảnh khi xem ảnh (qua showcase board) để thêm vào đây.",
-            ephemeral=True,
-        )
-        return
-
-    async def send_func(embed, view):
-        return await interaction.followup.send(embed=embed, view=view, wait=True)
-
-    await _send_ephemeral_image_list(send_func, f"⭐ Ảnh đã lưu của bạn ({len(urls)} ảnh)", urls, interaction.user.id)
-
-
-@bot.command(name="favorites", help="Xem lại các ảnh bạn đã lưu")
-async def favorites_prefix(ctx):
-    urls = await bot.loop.run_in_executor(None, db.get_favorites, ctx.author.id)
-    if not urls:
-        await ctx.send("📭 Bạn chưa lưu ảnh nào. Bấm nút 💾 Lưu ảnh khi xem ảnh (qua showcase board) để thêm vào đây.")
-        return
-
-    async def send_func(embed, view):
-        return await ctx.send(embed=embed, view=view)
-
-    await _send_ephemeral_image_list(send_func, f"⭐ Ảnh đã lưu của bạn ({len(urls)} ảnh)", urls, ctx.author.id)
-
-
-# ============================================================
 # Lệnh admin: /config, !config — cấu hình giới hạn kênh/role RIÊNG cho
 # từng server (guild). Nếu server chưa cấu hình gì qua đây, bot dùng
 # ALLOWED_CHANNEL_IDS/ALLOWED_ROLE_IDS từ biến môi trường làm mặc định.
@@ -1569,6 +1430,217 @@ async def config_prefix(ctx, action: str = None):
         return
 
     await ctx.send("⚠️ Hành động không hợp lệ. Dùng: `view | add_channel | remove_channel | clear_channels | add_role | remove_role | clear_roles`")
+
+
+# ============================================================
+# Lệnh admin: /setup — wizard thiết lập showcase board cho NHIỀU chủ đề
+# cùng lúc: chọn chủ đề (nhiều/chọn tất cả) -> gán kênh cho từng chủ đề
+# (chọn kênh có sẵn hoặc tạo kênh mới) -> tự động đăng showcase board vào
+# đúng kênh tương ứng khi đủ thông tin.
+# ============================================================
+
+class ChannelAssignWizard:
+    """Trạng thái đi qua từng chủ đề đã chọn, hỏi gán kênh, rồi đăng showcase board."""
+
+    def __init__(self, categories: list, admin_id: int):
+        self.categories = categories  # list[(key, info)], hàng đợi xử lý tuần tự
+        self.admin_id = admin_id
+        self.index = 0
+        self.assignments = {}  # category_key -> channel_id
+
+    async def start(self, interaction: discord.Interaction):
+        await self._prompt_current(interaction)
+
+    async def _prompt_current(self, interaction: discord.Interaction):
+        key, info = self.categories[self.index]
+        view = ChannelPickerView(self, key, info)
+        embed = discord.Embed(
+            title=f"📌 Chọn kênh cho: {info['label']}",
+            description=(
+                f"Chủ đề {self.index + 1}/{len(self.categories)} (`{key}`)\n\n"
+                "Chọn 1 kênh có sẵn ở dropdown bên dưới, hoặc bấm **➕ Tạo kênh mới**."
+            ),
+            color=discord.Color.blurple(),
+        )
+        await interaction.response.edit_message(embed=embed, view=view)
+
+    async def advance(self, interaction: discord.Interaction, channel: discord.TextChannel):
+        key, _info = self.categories[self.index]
+        self.assignments[key] = channel.id
+        self.index += 1
+
+        if self.index >= len(self.categories):
+            await self._finish(interaction)
+            return
+
+        await self._prompt_current(interaction)
+
+    async def _finish(self, interaction: discord.Interaction):
+        all_cats = await get_all_categories_async()
+        lines = []
+        for key, channel_id in self.assignments.items():
+            info = all_cats.get(key)
+            channel = interaction.guild.get_channel(channel_id) if interaction.guild else None
+            if not info or not channel:
+                lines.append(f"❌ `{key}`: không tìm thấy kênh hoặc chủ đề, bỏ qua.")
+                continue
+            if info.get("nsfw") and not _channel_allows_nsfw(channel):
+                lines.append(f"⚠️ **{info['label']}**: bỏ qua vì là NSFW nhưng {channel.mention} không phải kênh Age-Restricted.")
+                continue
+            _msg, error = await _post_showcase_board(channel, key, info, self.admin_id)
+            if error:
+                lines.append(f"❌ **{info['label']}**: {error}")
+            else:
+                lines.append(f"✅ **{info['label']}** → {channel.mention}")
+
+        embed = discord.Embed(
+            title="🎉 Thiết lập hoàn tất",
+            description="\n".join(lines) if lines else "(không có chủ đề nào được xử lý)",
+            color=discord.Color.green(),
+        )
+        await interaction.response.edit_message(embed=embed, view=None)
+
+
+class NewChannelModal(discord.ui.Modal):
+    def __init__(self, wizard: ChannelAssignWizard, category_key: str, info: dict):
+        super().__init__(title=f"Tạo kênh cho: {info['label'][:40]}")
+        self.wizard = wizard
+        self.category_key = category_key
+        self.channel_name_input = discord.ui.TextInput(
+            label="Tên kênh mới",
+            placeholder=f"vd: {category_key}",
+            default=category_key,
+            max_length=90,
+        )
+        self.add_item(self.channel_name_input)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        name = self.channel_name_input.value.strip()
+        if not name:
+            await interaction.response.send_message("⚠️ Tên kênh không hợp lệ.", ephemeral=True)
+            return
+        try:
+            new_channel = await interaction.guild.create_text_channel(name=name)
+        except discord.Forbidden:
+            await interaction.response.send_message("❌ Bot không có quyền tạo kênh trong server này.", ephemeral=True)
+            return
+        except Exception as e:
+            logger.warning(f"Lỗi tạo kênh mới trong /setup: {e}")
+            await interaction.response.send_message(f"❌ Lỗi khi tạo kênh: {e}", ephemeral=True)
+            return
+
+        await self.wizard.advance(interaction, new_channel)
+
+
+class ChannelPickerView(discord.ui.View):
+    def __init__(self, wizard: ChannelAssignWizard, category_key: str, info: dict):
+        super().__init__(timeout=300)
+        self.wizard = wizard
+        self.category_key = category_key
+        self.info = info
+
+        channel_select = discord.ui.ChannelSelect(
+            placeholder="Chọn kênh có sẵn...",
+            channel_types=[discord.ChannelType.text],
+            min_values=1,
+            max_values=1,
+        )
+        channel_select.callback = self._on_channel_selected
+        self.channel_select = channel_select
+        self.add_item(channel_select)
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.wizard.admin_id:
+            await interaction.response.send_message("⚠️ Chỉ người chạy lệnh `/setup` mới thao tác được ở đây.", ephemeral=True)
+            return False
+        return True
+
+    async def _on_channel_selected(self, interaction: discord.Interaction):
+        picked = self.channel_select.values[0]
+        real_channel = interaction.guild.get_channel(picked.id)
+        if real_channel is None:
+            await interaction.response.send_message("❌ Không lấy được kênh này, thử lại nhé.", ephemeral=True)
+            return
+        await self.wizard.advance(interaction, real_channel)
+
+    @discord.ui.button(label="➕ Tạo kênh mới", style=discord.ButtonStyle.primary)
+    async def create_channel_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(NewChannelModal(self.wizard, self.category_key, self.info))
+
+
+class CategoryPickerView(discord.ui.View):
+    """Bước 1 của /setup: chọn 1 hoặc nhiều chủ đề (hoặc 'Chọn tất cả')."""
+
+    def __init__(self, categories: list, admin_id: int):
+        super().__init__(timeout=300)
+        self.categories = categories  # list[(key, info)]
+        self.admin_id = admin_id
+
+        options = [
+            discord.SelectOption(label="✅ Chọn tất cả", value="__all__", description=f"Thiết lập cả {len(categories)} chủ đề")
+        ]
+        for key, info in categories[:24]:  # chừa 1 chỗ cho "Chọn tất cả", tối đa 25 lựa chọn
+            options.append(discord.SelectOption(label=info["label"][:100], value=key, description=f"`{key}`"))
+
+        select = discord.ui.Select(
+            placeholder="Chọn 1 hoặc nhiều chủ đề cần thiết lập...",
+            min_values=1,
+            max_values=len(options),
+            options=options,
+        )
+        select.callback = self._on_select
+        self.add_item(select)
+        self.select = select
+
+    def build_embed(self) -> discord.Embed:
+        lines = [f"**{i + 1}.** {info['label']} (`{key}`)" for i, (key, info) in enumerate(self.categories)]
+        return discord.Embed(
+            title="🛠️ Thiết lập showcase board",
+            description=(
+                "Chọn chủ đề cần thiết lập ở dropdown bên dưới (chọn nhiều được, "
+                "hoặc \"✅ Chọn tất cả\"):\n\n" + "\n".join(lines)
+            ),
+            color=discord.Color.blurple(),
+        )
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.admin_id:
+            await interaction.response.send_message("⚠️ Chỉ người chạy lệnh `/setup` mới thao tác được ở đây.", ephemeral=True)
+            return False
+        return True
+
+    async def _on_select(self, interaction: discord.Interaction):
+        values = self.select.values
+        if "__all__" in values:
+            selected_keys = {key for key, _ in self.categories}
+        else:
+            selected_keys = set(values)
+
+        selected = [(key, info) for key, info in self.categories if key in selected_keys]
+        if not selected:
+            await interaction.response.send_message("⚠️ Chưa chọn chủ đề nào.", ephemeral=True)
+            return
+
+        wizard = ChannelAssignWizard(selected, self.admin_id)
+        await wizard.start(interaction)
+
+
+@bot.tree.command(name="setup", description="[Admin] Wizard thiết lập showcase board cho nhiều chủ đề cùng lúc")
+async def setup_slash(interaction: discord.Interaction):
+    if not is_admin(interaction.user.id):
+        await interaction.response.send_message("⚠️ Chỉ admin mới dùng được lệnh này.", ephemeral=True)
+        return
+    if interaction.guild is None:
+        await interaction.response.send_message("⚠️ Lệnh này chỉ dùng được trong server, không dùng được ở DM.", ephemeral=True)
+        return
+
+    all_cats = await get_all_categories_async()
+    if not all_cats:
+        await interaction.response.send_message("❌ Chưa có chủ đề nào để thiết lập.", ephemeral=True)
+        return
+
+    view = CategoryPickerView(list(all_cats.items()), interaction.user.id)
+    await interaction.response.send_message(embed=view.build_embed(), view=view, ephemeral=True)
 
 
 TOKEN = os.getenv("DISCORD_TOKEN")

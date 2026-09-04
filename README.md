@@ -35,9 +35,8 @@ lưu vào MongoDB, có fallback cào trực tiếp khi DB hết ảnh khả dụ
   dành riêng cho admin.
 - **`db.py`** — kết nối MongoDB dùng chung cho cả `crawl_job.py` và `bot.py`.
   Có category tuỳ chỉnh (`custom_categories`, có field `nsfw`), phiên xem
-  ảnh bền vững (`paginator_sessions`), ảnh yêu thích (`favorites`), cấu hình
-  riêng theo server (`guild_configs`), metadata thời điểm crawl gần nhất
-  (`meta`).
+  ảnh bền vững (`paginator_sessions`), cấu hình riêng theo server
+  (`guild_configs`), metadata thời điểm crawl gần nhất (`meta`).
 - **`pinterest_crawler.py`** — logic cào Pinterest (dùng endpoint nội bộ,
   không chính thức — xem cảnh báo trong docstring của file).
 - **`keep_alive.py`** — mở 1 server Flask nhỏ để giữ bot "thức" trên các nền
@@ -119,18 +118,9 @@ hay sau khi bot restart, vì trạng thái phiên xem ảnh được lưu trong 
 | `!cleanup <chủ_đề>` | Prefix | Tương tự |
 | `/showcase <chủ_đề> [kênh]` | Slash | Đăng "bảng giới thiệu" 1 chủ đề vào kênh: ảnh mẫu + tag admin + nút "🎲 Bắt đầu" cho mọi người bấm. Chặn nếu chủ đề là NSFW mà kênh không phải Age-Restricted |
 | `!showcase <chủ_đề> [#kênh]` | Prefix | Tương tự, kênh bỏ trống = kênh hiện tại |
+| `/setup` | Slash | **Wizard thiết lập hàng loạt** — chọn nhiều chủ đề (hoặc "Chọn tất cả") cùng lúc, rồi lần lượt gán kênh cho từng chủ đề (chọn kênh có sẵn hoặc tạo kênh mới ngay trong wizard), tự động đăng showcase board vào đúng kênh khi xong. Xem chi tiết bên dưới |
 | `/config <action> [kênh] [role]` | Slash | Cấu hình giới hạn kênh/role dùng lệnh ảnh **riêng cho server này** (xem mục "Cấu hình riêng theo server" bên dưới) |
 | `!config <action> [#kênh/@role]` | Prefix | Tương tự |
-
-### Lệnh cho mọi người
-
-| Lệnh | Loại | Mô tả |
-|---|---|---|
-| `/favorites` | Slash | Xem lại các ảnh đã lưu. Khi xem ở đây, nút 💾 đổi thành 🗑️ **Xoá khỏi yêu thích** |
-| `!favorites` | Prefix | Tương tự |
-
-Giới hạn tối đa **100 ảnh yêu thích/người** — lưu thêm khi đã đầy sẽ báo lỗi,
-cần xoá bớt qua `/favorites` trước.
 
 ## Showcase board — bảng giới thiệu chủ đề
 
@@ -139,13 +129,36 @@ quản lý ở góc embed) kèm nút **"🎲 Bắt đầu"**. Ai bấm nút này
 **riêng tư** (ephemeral — chỉ người bấm thấy) chứa 1 ảnh ngẫu nhiên của chủ
 đề đó, kèm 3 nút:
 - **◀** / **▶** — chuyển ảnh (giống `/img`, ảnh mới lấy random từ MongoDB/fallback Pinterest khi cần)
-- **💾 Lưu ảnh** — lưu ảnh vào danh sách yêu thích cá nhân (xem lại bằng `/favorites`), đồng thời bot **gửi tin nhắn riêng (DM)** cho bạn kèm ảnh + ghi chú (kèm định dạng/dung lượng ảnh nếu lấy được). Nếu bạn tắt nhận DM từ thành viên server, bot vẫn lưu ảnh bình thường và báo lý do lỗi DM ngay tại kênh (chỉ bạn thấy được).
+- **💾 Lưu ảnh** — bot **gửi ảnh qua tin nhắn riêng (DM)** cho người bấm, kèm
+  ghi chú (thêm định dạng/dung lượng ảnh nếu lấy được). Nếu người đó tắt
+  nhận DM từ thành viên server, bot báo lý do lỗi ngay tại kênh (chỉ người
+  bấm thấy được). Chỉ gửi DM ngay lúc đó — không lưu vào danh sách nào để
+  xem lại sau.
 
 Nút "Bắt đầu" trên showcase board hoạt động vĩnh viễn giống nút Trước/Sau
 (không hết hạn, không phụ thuộc bot có restart hay không) — bạn chỉ cần đăng
 1 lần, để đó lâu dài trong kênh.
 
+## `/setup` — wizard thiết lập hàng loạt
 
+Thay vì chạy `/showcase` từng chủ đề một, `/setup` cho phép thiết lập nhiều
+chủ đề cùng lúc theo 2 bước:
+
+1. **Chọn chủ đề:** bot liệt kê tất cả chủ đề hiện có (đánh số), hiện dropdown
+   cho phép chọn nhiều chủ đề cùng lúc hoặc bấm **"✅ Chọn tất cả"**.
+2. **Gán kênh cho từng chủ đề:** bot lần lượt hỏi từng chủ đề đã chọn —
+   chọn 1 kênh có sẵn từ dropdown kênh, hoặc bấm **"➕ Tạo kênh mới"** (mở
+   form nhập tên, bot tự tạo kênh text mới trong server).
+
+Sau khi gán đủ kênh cho tất cả chủ đề đã chọn, bot tự động đăng showcase
+board (giống `/showcase`) vào đúng kênh tương ứng cho từng chủ đề, rồi báo
+kết quả tổng kết. Chủ đề NSFW mà bạn gán vào kênh không phải Age-Restricted
+sẽ tự động bị bỏ qua (có ghi rõ lý do trong kết quả).
+
+**Lưu ý quyền:** để dùng được "➕ Tạo kênh mới", bot cần quyền **Manage
+Channels** trong server (Server Settings → Roles → role của bot → bật
+"Manage Channels"). Thiếu quyền này, bot vẫn dùng được phần chọn kênh có
+sẵn bình thường, chỉ riêng nút tạo kênh mới sẽ báo lỗi.
 
 ## Thêm/sửa chủ đề (category)
 
