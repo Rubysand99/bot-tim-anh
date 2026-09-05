@@ -12,7 +12,6 @@ import requests
 from discord import app_commands
 from discord.ext import commands, tasks
 from keep_alive import keep_alive
-from pinterest_crawler import search_pinterest_images_with_retry
 from categories import CATEGORIES
 import db
 import crawl_job
@@ -403,41 +402,46 @@ async def category_autocomplete(interaction: discord.Interaction, current: str):
 
 
 # ============================================================
-# Lấy ảnh: ưu tiên MongoDB (random trong category, không theo thứ tự),
-# fallback cào Pinterest trực tiếp nếu DB hết ảnh khả dụng. Có đo thời gian
-# và cảnh báo (-> kênh log nếu bật) khi 1 bước chậm bất thường, để dễ chẩn
-# đoán chỗ nào đang làm bot phản hồi chậm.
+# Lấy ảnh: CHỈ đọc từ MongoDB (kho ảnh đã crawl sẵn qua crawl_job.py, chạy
+# định kỳ mỗi 2 tiếng qua GitHub Actions cron). KHÔNG cào Pinterest trực
+# tiếp lúc user đang chờ phản hồi nữa — đây từng là nguồn gây timeout "không
+# phản hồi kịp thời" khó lường (worst case cũ có thể tới 36s/17s tuỳ bản).
+# Nếu category hết ảnh khả dụng, báo ngay cho user thay vì bắt chờ cào —
+# đợi tối đa 2 tiếng tới lần crawl job kế tiếp là sẽ có ảnh mới.
 # ============================================================
 
 SLOW_DB_THRESHOLD_SECONDS = 3
-SLOW_CRAWL_THRESHOLD_SECONDS = 15
-
-# Circuit breaker cho fallback Pinterest: nếu thất bại liên tiếp quá
-# nhiều lần trong thời gian ngắn (dấu hiệu Pinterest đang chặn/lỗi diện
-# rộng), tạm ngừng thử fallback một thời gian thay vì cứ bắt user chờ
-# timeout mỗi lần — vừa nhanh hơn, vừa giảm rủi ro bị chặn IP nặng hơn.
-PINTEREST_CIRCUIT_FAIL_THRESHOLD = 3
-PINTEREST_CIRCUIT_OPEN_SECONDS = 300  # 5 phút
-
-_pinterest_circuit = {"fail_count": 0, "open_until": 0.0}
+CRAWL_INTERVAL_HOURS = 2  # phải khớp lịch cron trong .github/workflows/main.yml
 
 
-def _pinterest_circuit_is_open() -> bool:
-    return time.monotonic() < _pinterest_circuit["open_until"]
+async def _next_crawl_eta_text() -> str:
+    """
+    Ước tính thời gian tới lần crawl_job.py kế tiếp, dựa vào last_crawl_time
+    (lưu trong DB mỗi khi crawl job chạy xong) + chu kỳ CRAWL_INTERVAL_HOURS.
+    Dùng để báo user biết cần chờ bao lâu khi 1 category hết ảnh khả dụng,
+    thay vì chỉ nói chung chung "thử lại sau".
+    """
+    last_crawl = await bot.loop.run_in_executor(None, db.get_last_crawl_time)
+    if not last_crawl:
+        return "chưa rõ lịch crawl (chưa từng chạy job crawl nào)"
 
+    if last_crawl.tzinfo is None:
+        last_crawl = last_crawl.replace(tzinfo=timezone.utc)
+    next_crawl = last_crawl + timedelta(hours=CRAWL_INTERVAL_HOURS)
+    remaining_seconds = (next_crawl - datetime.now(timezone.utc)).total_seconds()
 
-def _pinterest_circuit_record_result(success: bool) -> None:
-    if success:
-        _pinterest_circuit["fail_count"] = 0
-        return
-    _pinterest_circuit["fail_count"] += 1
-    if _pinterest_circuit["fail_count"] >= PINTEREST_CIRCUIT_FAIL_THRESHOLD:
-        _pinterest_circuit["open_until"] = time.monotonic() + PINTEREST_CIRCUIT_OPEN_SECONDS
-        logger.warning(
-            f"Circuit breaker MỞ cho fallback Pinterest: thất bại "
-            f"{PINTEREST_CIRCUIT_FAIL_THRESHOLD} lần liên tiếp, tạm ngừng thử trong "
-            f"{PINTEREST_CIRCUIT_OPEN_SECONDS // 60} phút."
-        )
+    if remaining_seconds <= 0:
+        return "sắp có (đang chờ job crawl chạy)"
+
+    minutes = int(remaining_seconds // 60)
+    if minutes < 1:
+        return "chưa đầy 1 phút nữa"
+    if minutes < 60:
+        return f"khoảng {minutes} phút nữa"
+    hours, mins = divmod(minutes, 60)
+    if mins == 0:
+        return f"khoảng {hours} tiếng nữa"
+    return f"khoảng {hours} tiếng {mins} phút nữa"
 
 
 async def _fetch_next_image_url(category_key: str, keyword: str, exclude_urls: list):
@@ -446,7 +450,7 @@ async def _fetch_next_image_url(category_key: str, keyword: str, exclude_urls: l
             doc = db.get_next_image(category_key, exclude_urls)
             return doc["image_url"] if doc else None
         except Exception as e:
-            logger.warning(f"Lỗi đọc MongoDB, sẽ fallback sang cào trực tiếp: {e}")
+            logger.warning(f"Lỗi đọc MongoDB khi lấy ảnh cho '{category_key}': {e}")
             return None
 
     t0 = time.monotonic()
@@ -457,45 +461,13 @@ async def _fetch_next_image_url(category_key: str, keyword: str, exclude_urls: l
     else:
         logger.info(f"[perf] Đọc MongoDB cho '{category_key}': {db_elapsed:.2f}s")
 
-    if url:
-        return url
-
-    if _pinterest_circuit_is_open():
-        remaining = int(_pinterest_circuit["open_until"] - time.monotonic())
-        logger.info(f"[circuit] Bỏ qua fallback Pinterest (đang tạm ngừng, còn {remaining}s).")
-        return None
-
-    def fetch_crawl():
-        try:
-            # Không truyền retries riêng nữa -> dùng default mới (2 lần,
-            # worst case ~17s thay vì 36s) — xem ghi chú trong
-            # pinterest_crawler.search_pinterest_images_with_retry().
-            results = search_pinterest_images_with_retry(keyword, limit=20)
-        except Exception as e:
-            logger.warning(f"Lỗi fallback cào Pinterest: {e}")
-            return None
-        for u in results:
-            if u not in exclude_urls:
-                return u
-        return None
-
-    t1 = time.monotonic()
-    url = await bot.loop.run_in_executor(None, fetch_crawl)
-    crawl_elapsed = time.monotonic() - t1
-    if crawl_elapsed > SLOW_CRAWL_THRESHOLD_SECONDS:
-        logger.warning(f"Fallback cào Pinterest cho '{category_key}' chậm bất thường: {crawl_elapsed:.1f}s")
-    else:
-        logger.info(f"[perf] Fallback cào Pinterest cho '{category_key}': {crawl_elapsed:.2f}s")
-
-    _pinterest_circuit_record_result(success=url is not None)
-
     return url
 
 
 def _build_image_embed(label: str, url: str) -> discord.Embed:
     embed = discord.Embed(title=f"🖼️ {label}", color=discord.Color.red())
     embed.set_image(url=url)
-    embed.set_footer(text="Nguồn: kho ảnh đã crawl · fallback Pinterest")
+    embed.set_footer(text="Nguồn: kho ảnh đã crawl sẵn")
     return embed
 
 
@@ -571,8 +543,11 @@ async def _paginator_navigate(interaction: discord.Interaction, direction: int, 
     # (đã defer() từ đầu hàm nên không còn bị giới hạn 3 giây ở đây nữa)
     new_url = await _fetch_next_image_url(session["category_key"], session["keyword"], images)
     if not new_url:
+        eta = await _next_crawl_eta_text()
         await interaction.followup.send(
-            "❌ Hết ảnh khả dụng cho chủ đề này rồi, thử lại sau nhé.", ephemeral=True
+            f"❌ Hết ảnh khả dụng cho chủ đề này rồi. Kho ảnh tự làm mới mỗi "
+            f"{CRAWL_INTERVAL_HOURS} tiếng — lần crawl kế tiếp {eta}.",
+            ephemeral=True,
         )
         return
 
@@ -788,7 +763,12 @@ class ShowcaseStartView(discord.ui.View):
 
         url = await _fetch_next_image_url(category_key, info["keyword"], [])
         if not url:
-            await interaction.followup.send(f"❌ Không tìm thấy ảnh nào cho chủ đề: **{info['label']}**", ephemeral=True)
+            eta = await _next_crawl_eta_text()
+            await interaction.followup.send(
+                f"❌ Không tìm thấy ảnh nào cho chủ đề: **{info['label']}**. "
+                f"Lần crawl kế tiếp {eta}.",
+                ephemeral=True,
+            )
             return
 
         async def send_func(embed, view):
@@ -839,7 +819,11 @@ async def img_slash(interaction: discord.Interaction, chu_de: str):
 
     url = await _fetch_next_image_url(chu_de, info["keyword"], [])
     if not url:
-        await interaction.followup.send(f"❌ Không tìm thấy ảnh nào cho chủ đề: **{info['label']}**")
+        eta = await _next_crawl_eta_text()
+        await interaction.followup.send(
+            f"❌ Không tìm thấy ảnh nào cho chủ đề: **{info['label']}**. "
+            f"Lần crawl kế tiếp {eta}."
+        )
         return
 
     async def send_func(embed, view):
@@ -877,7 +861,11 @@ async def img_prefix(ctx, chu_de: str = None):
 
     url = await _fetch_next_image_url(category_key, info["keyword"], [])
     if not url:
-        await ctx.send(f"❌ Không tìm thấy ảnh nào cho chủ đề: **{info['label']}**")
+        eta = await _next_crawl_eta_text()
+        await ctx.send(
+            f"❌ Không tìm thấy ảnh nào cho chủ đề: **{info['label']}**. "
+            f"Lần crawl kế tiếp {eta}."
+        )
         return
 
     async def send_func(embed, view):
@@ -910,8 +898,9 @@ async def _get_random_image_result(channel):
         info = all_cats.get(category_key, {"label": category_key, "keyword": category_key})
         return category_key, info["label"], info["keyword"], doc["image_url"]
 
-    # DB trống hoàn toàn ảnh khả dụng (trong phạm vi allowed_keys) -> fallback:
-    # random 1 chủ đề (vẫn trong allowed_keys) rồi cào trực tiếp
+    # DB trống hoàn toàn ảnh khả dụng (trong phạm vi allowed_keys) -> thử
+    # random 1 chủ đề khác (vẫn trong allowed_keys) qua _fetch_next_image_url
+    # (chỉ đọc DB, không cào Pinterest trực tiếp nữa — xem ghi chú đầu file).
     category_key = random.choice(allowed_keys)
     info = all_cats[category_key]
     url = await _fetch_next_image_url(category_key, info["keyword"], [])
@@ -937,7 +926,8 @@ async def random_slash(interaction: discord.Interaction):
 
     category_key, label, keyword, url = await _get_random_image_result(interaction.channel)
     if not url:
-        await interaction.followup.send("❌ Kho ảnh hiện đang trống, thử lại sau nhé.")
+        eta = await _next_crawl_eta_text()
+        await interaction.followup.send(f"❌ Kho ảnh hiện đang trống. Lần crawl kế tiếp {eta}.")
         return
 
     async def send_func(embed, view):
@@ -963,7 +953,8 @@ async def random_prefix(ctx):
 
     category_key, label, keyword, url = await _get_random_image_result(ctx.channel)
     if not url:
-        await ctx.send("❌ Kho ảnh hiện đang trống, thử lại sau nhé.")
+        eta = await _next_crawl_eta_text()
+        await ctx.send(f"❌ Kho ảnh hiện đang trống. Lần crawl kế tiếp {eta}.")
         return
 
     async def send_func(embed, view):
@@ -1325,7 +1316,8 @@ async def _post_showcase_board(target_channel, category_key: str, info: dict, ad
     """Trả về (message, error_text). error_text != None nếu thất bại."""
     preview_url = await _fetch_next_image_url(category_key, info["keyword"], [])
     if not preview_url:
-        return None, f"❌ Không lấy được ảnh mẫu cho chủ đề: **{info['label']}**"
+        eta = await _next_crawl_eta_text()
+        return None, f"❌ Không lấy được ảnh mẫu cho chủ đề: **{info['label']}** (kho đang trống, lần crawl kế tiếp {eta})."
 
     embed = discord.Embed(title=f"🖼️ {info['label']}", color=discord.Color.gold())
     embed.set_image(url=preview_url)

@@ -4,5 +4,5 @@ Số bản của bot — cập nhật mỗi khi thêm tính năng/sửa lỗi đ
 Chỉ cần sửa 2 biến bên dưới, không cần đụng vào bot.py.
 """
 
-__version__ = "1.4.1"
-__description__ = "Giảm worst-case thời gian chờ fallback Pinterest từ 36s xuống ~17s (retries 3→2, timeout 10s→7s, backoff cố định 3s) — nghi ngờ là nguyên nhân các ca 'không phản hồi kịp thời' còn sót lại dù defer() đã đúng và Mongo đã nhanh."
+__version__ = "1.5.0"
+__description__ = "Bot không còn cào Pinterest trực tiếp lúc user chờ nữa — chỉ lấy ảnh từ MongoDB (crawl_job.py chạy mỗi 2 tiếng qua GitHub Actions). Khi 1 chủ đề hết ảnh, báo rõ còn khoảng bao lâu tới lần crawl kế tiếp thay vì chỉ nói chung chung."

@@ -1,38 +1,36 @@
-# bot-tim-anh.
+# bot-tim-anh
 
 Bot Discord tìm/lấy ảnh theo chủ đề, dữ liệu được crawl sẵn từ Pinterest và
-lưu vào MongoDB, có fallback cào trực tiếp khi DB hết ảnh khả dụng.
+lưu vào MongoDB. Bot CHỈ đọc từ MongoDB lúc user dùng lệnh — không cào
+Pinterest trực tiếp nữa (đã bỏ hẳn, xem lý do ở mục Kiến trúc bên dưới).
 
 ## Kiến trúc
 
 ```
-┌─────────────────┐   cron mỗi 2h    ┌──────────────┐
-│  GitHub Actions  │ ───────────────▶ │   MongoDB    │
-│  (crawl_job.py)  │   crawl & lưu    │  (Atlas)     │
-└─────────────────┘                  └──────┬───────┘
-                                             │ đọc random
-                                             ▼
-                                      ┌──────────────┐      hết ảnh khả dụng
-                                      │   bot.py     │ ────────────────────▶ cào trực
-                                      │  (Render)    │                       tiếp Pinterest
-                                      └──────────────┘
+┌─────────────────┐   cron mỗi 2h    ┌──────────────┐   đọc random   ┌──────────────┐
+│  GitHub Actions  │ ───────────────▶ │   MongoDB    │ ─────────────▶ │   bot.py     │
+│  (crawl_job.py)  │   crawl & lưu    │  (Atlas)     │                │  (Railway)   │
+└─────────────────┘                  └──────────────┘                └──────────────┘
 ```
 
 - **`crawl_job.py`** — chạy định kỳ qua GitHub Actions (`.github/workflows/main.yml`),
   cào ảnh Pinterest theo từng category (tĩnh trong `categories.py` + category
   admin thêm qua Discord), lưu vào MongoDB (bỏ qua ảnh trùng URL nhờ unique
   index). Gửi cảnh báo qua Discord webhook nếu toàn bộ category lỗi hoặc có
-  category sắp cạn ảnh. Ghi lại thời điểm crawl gần nhất để `bot.py` biết khi
-  nào nên tự crawl ngay 1 category mới thêm thay vì chờ chu kỳ tiếp theo.
-- **`bot.py`** — bot Discord, deploy trên Render (xem `procfile`). Lệnh `/img`
-  lấy ảnh NGẪU NHIÊN trong category đã chọn từ MongoDB (không theo thứ tự),
-  chỉ fallback cào Pinterest trực tiếp khi category đó hết ảnh khả dụng
-  trong DB — có circuit breaker tự tạm ngừng fallback nếu Pinterest thất bại
-  liên tiếp. Nút Trước/Sau trong embed hoạt động vĩnh viễn (không hết hạn, kể
-  cả sau khi bot restart) vì trạng thái được lưu trong MongoDB thay vì RAM.
-  Có cooldown, giới hạn kênh/role theo từng server (`/config`), category có
-  thể gắn cờ NSFW (chỉ dùng được ở kênh Age-Restricted), và lệnh quản trị
-  dành riêng cho admin.
+  category sắp cạn ảnh. Ghi lại thời điểm crawl gần nhất — dùng để `bot.py`
+  báo user biết còn khoảng bao lâu tới lần crawl kế tiếp khi 1 category hết ảnh.
+- **`bot.py`** — bot Discord, deploy trên Railway (xem `Procfile`). Lệnh `/img`
+  lấy ảnh NGẪU NHIÊN trong category đã chọn từ MongoDB (không theo thứ tự).
+  Nếu category hết ảnh khả dụng, bot báo ngay cho user (kèm ước tính thời
+  gian tới lần crawl kế tiếp) thay vì tự cào Pinterest ngay lúc đó — bot
+  **từng** có cơ chế "fallback cào trực tiếp" khi DB hết ảnh, nhưng đã bỏ
+  hẳn vì đây là nguồn gây timeout "không phản hồi kịp thời" khó lường (cào
+  trực tiếp có thể mất tới hàng chục giây, trong khi nút bấm Discord không
+  có chỉ báo "đang tải" rõ ràng cho việc chờ lâu như vậy). Nút Trước/Sau
+  trong embed hoạt động vĩnh viễn (không hết hạn, kể cả sau khi bot restart)
+  vì trạng thái được lưu trong MongoDB thay vì RAM. Có cooldown, giới hạn
+  kênh/role theo từng server (`/config`), category có thể gắn cờ NSFW (chỉ
+  dùng được ở kênh Age-Restricted), và lệnh quản trị dành riêng cho admin.
 - **`db.py`** — kết nối MongoDB dùng chung cho cả `crawl_job.py` và `bot.py`.
   Có category tuỳ chỉnh (`custom_categories`, có field `nsfw`), phiên xem
   ảnh bền vững (`paginator_sessions`), cấu hình riêng theo server
@@ -55,22 +53,22 @@ pip install -r requirements.txt
 
 | Biến | Bắt buộc ở | Mô tả |
 |---|---|---|
-| `DISCORD_TOKEN` | `bot.py` (Render) | Token bot Discord |
-| `MONGO_URI` | `bot.py` (Render) **và** GitHub Actions Secret | Connection string MongoDB Atlas |
-| `PORT` | `keep_alive.py` (Render tự cấp) | Port cho server Flask giữ bot thức |
-| `ADMIN_USER_IDS` | `bot.py` (Render), tuỳ chọn | Danh sách Discord user ID admin, cách nhau bởi dấu phẩy. Mặc định sẵn 1 admin (`846332174734983219`) kể cả khi không set biến này. Admin bỏ qua cooldown + giới hạn kênh/role, và dùng được `/addcategory`, `/removecategory`, `/cleanup`. |
-| `ALLOWED_CHANNEL_IDS` | `bot.py` (Render), tuỳ chọn | **Mặc định toàn cục** khi 1 server chưa dùng `/config` để tự đặt riêng. Nếu set, lệnh ảnh chỉ dùng được ở các kênh này (ID, cách nhau bởi dấu phẩy). Để trống = không giới hạn kênh. Admin luôn bypass. |
-| `ALLOWED_ROLE_IDS` | `bot.py` (Render), tuỳ chọn | **Mặc định toàn cục**, tương tự trên nhưng cho role. Server nào đã tự cấu hình qua `/config` thì dùng cấu hình riêng, bỏ qua biến này. |
+| `DISCORD_TOKEN` | `bot.py` (Railway) | Token bot Discord |
+| `MONGO_URI` | `bot.py` (Railway) **và** GitHub Actions Secret | Connection string MongoDB Atlas |
+| `PORT` | `keep_alive.py` (Railway tự cấp) | Port cho server Flask giữ bot thức |
+| `ADMIN_USER_IDS` | `bot.py` (Railway), tuỳ chọn | Danh sách Discord user ID admin, cách nhau bởi dấu phẩy. Mặc định sẵn 1 admin (`846332174734983219`) kể cả khi không set biến này. Admin bỏ qua cooldown + giới hạn kênh/role, và dùng được `/addcategory`, `/removecategory`, `/cleanup`. |
+| `ALLOWED_CHANNEL_IDS` | `bot.py` (Railway), tuỳ chọn | **Mặc định toàn cục** khi 1 server chưa dùng `/config` để tự đặt riêng. Nếu set, lệnh ảnh chỉ dùng được ở các kênh này (ID, cách nhau bởi dấu phẩy). Để trống = không giới hạn kênh. Admin luôn bypass. |
+| `ALLOWED_ROLE_IDS` | `bot.py` (Railway), tuỳ chọn | **Mặc định toàn cục**, tương tự trên nhưng cho role. Server nào đã tự cấu hình qua `/config` thì dùng cấu hình riêng, bỏ qua biến này. |
 | `DISCORD_WEBHOOK_URL` | `crawl_job.py` (GitHub Actions Secret), tuỳ chọn | Webhook Discord để nhận cảnh báo khi crawl lỗi toàn bộ hoặc 1 category sắp cạn ảnh. Bỏ trống thì chỉ ghi log, không gửi cảnh báo. |
-| `LOG_CHANNEL_ID` | `bot.py` (Render), tuỳ chọn | ID kênh Discord nhận log lỗi tự động (mọi `logger.warning`/`logger.error` trong bot) + heartbeat ping mỗi 10 phút. Bỏ trống = tắt tính năng này, chỉ log ra Render logs như trước. |
+| `LOG_CHANNEL_ID` | `bot.py` (Railway), tuỳ chọn | ID kênh Discord nhận log lỗi tự động (mọi `logger.warning`/`logger.error` trong bot) + heartbeat ping mỗi 10 phút. Bỏ trống = tắt tính năng này, chỉ log ra Railway logs như trước. |
 
 Tạo `MONGO_URI` ở 2 nơi riêng biệt vì đây là 2 môi trường chạy khác nhau:
-- Render → Environment variables (cho `bot.py`)
+- Railway → service `bot-tim-anh` → tab Variables (cho `bot.py`)
 - GitHub repo → Settings → Secrets and variables → Actions (cho `crawl_job.py`)
 
 `DISCORD_WEBHOOK_URL` (tuỳ chọn): tạo trong Discord ở kênh muốn nhận cảnh báo →
 Server Settings → Integrations → Webhooks → New Webhook → copy URL → thêm vào
-GitHub Actions Secret (không cần set trên Render, chỉ `crawl_job.py` dùng).
+GitHub Actions Secret (không cần set trên Railway, chỉ `crawl_job.py` dùng).
 
 ## Chạy crawl job thủ công (test local qua Termux)
 
@@ -130,7 +128,7 @@ hay sau khi bot restart, vì trạng thái phiên xem ảnh được lưu trong 
 quản lý ở góc embed) kèm nút **"🎲 Bắt đầu"**. Ai bấm nút này sẽ nhận 1 embed
 **riêng tư** (ephemeral — chỉ người bấm thấy) chứa 1 ảnh ngẫu nhiên của chủ
 đề đó, kèm 3 nút:
-- **◀** / **▶** — chuyển ảnh (giống `/img`, ảnh mới lấy random từ MongoDB/fallback Pinterest khi cần)
+- **◀** / **▶** — chuyển ảnh (giống `/img`, ảnh mới lấy random từ MongoDB)
 - **💾 Lưu ảnh** — bot **gửi ảnh qua tin nhắn riêng (DM)** cho người bấm, kèm
   ghi chú (thêm định dạng/dung lượng ảnh nếu lấy được). Nếu người đó tắt
   nhận DM từ thành viên server, bot báo lý do lỗi ngay tại kênh (chỉ người
@@ -202,7 +200,7 @@ riêng bằng `/config`, không ảnh hưởng tới server khác:
 | `clear_roles` | Xoá hết giới hạn role (ai cũng dùng được) |
 
 Server nào **chưa từng dùng `/config`** sẽ dùng `ALLOWED_CHANNEL_IDS`/
-`ALLOWED_ROLE_IDS` từ biến môi trường Render làm mặc định (giữ tương thích
+`ALLOWED_ROLE_IDS` từ biến môi trường Railway làm mặc định (giữ tương thích
 ngược). Ngay khi server đó chạy `/config add_channel` hoặc `add_role` lần
 đầu, cấu hình riêng của server sẽ thay thế hoàn toàn mặc định toàn cục cho
 server đó — các server khác không bị ảnh hưởng.
@@ -221,46 +219,44 @@ hoặc sửa trực tiếp `categories.py`). Category NSFW:
 Tất cả category có sẵn trong `categories.py` hiện đang để `nsfw: False` mặc
 định — tự sửa lại `True` cho category nào bạn thấy cần giới hạn kênh.
 
-## Circuit breaker cho fallback Pinterest
+## Khi 1 category hết ảnh khả dụng
 
-Nếu fallback cào Pinterest thất bại liên tiếp 3 lần (dấu hiệu Pinterest
-đang chặn IP hoặc lỗi diện rộng), bot tự "ngắt mạch" — tạm ngừng thử fallback
-trong 5 phút, trả lời ngay "hết ảnh khả dụng" thay vì bắt người dùng chờ hết
-timeout mỗi lần. Sau 5 phút tự thử lại bình thường. Trạng thái này được log
-(và gửi vào `LOG_CHANNEL_ID` nếu bật) khi circuit mở.
+`bot.py` **không** tự cào Pinterest trực tiếp khi hết ảnh — chỉ đọc từ
+MongoDB. Nếu category đó hết ảnh khả dụng lúc user dùng lệnh, bot báo lỗi
+ngay kèm ước tính thời gian tới lần `crawl_job.py` kế tiếp (dựa vào
+`last_crawl_time` lưu trong DB + chu kỳ `CRAWL_INTERVAL_HOURS` = 2 tiếng,
+khớp lịch cron trong `.github/workflows/main.yml`), ví dụ: *"Lần crawl kế
+tiếp khoảng 45 phút nữa"*.
 
-**Thời gian chờ tối đa 1 lần fallback:** `search_pinterest_images_with_retry`
-thử tối đa 2 lần, mỗi lần timeout 7 giây, nghỉ 3 giây giữa 2 lần — worst
-case ~17 giây (trước đây là 3 lần × 10s + backoff tăng dần, tới 36 giây).
-Giảm xuống vì nút bấm (Trước/Sau, Bắt đầu...) sau khi `defer()` không có
-chỉ báo "đang tải" trực quan trên Discord mobile — im lặng quá lâu (gần
-nửa phút) từng khiến ứng dụng tự báo "không phản hồi kịp thời" dù bot vẫn
-đang xử lý bình thường phía sau và cuối cùng vẫn trả ảnh về được.
+(Circuit breaker + fallback cào trực tiếp Pinterest lúc user đang chờ đã bị
+bỏ hẳn khỏi `bot.py` — từng là nguồn gây timeout "không phản hồi kịp thời"
+khó lường, có thể mất tới hàng chục giây trong khi nút bấm Discord không có
+chỉ báo "đang tải" rõ ràng cho việc chờ lâu như vậy. `pinterest_crawler.py`
+giờ chỉ còn được `crawl_job.py` dùng, chạy nền qua GitHub Actions.)
 
 ## Giám sát
 
-- **Health check:** `GET /health` trên URL Render của bot trả JSON
+- **Health check:** `GET /health` trên URL Railway của bot trả JSON
   `{"status": "ok"|"degraded", "uptime_seconds": ..., "mongo": "ok"|"error: ..."}`.
   `GET /` (route gốc) vẫn giữ nguyên để phục vụ mục đích ping giữ bot thức.
 - **Cảnh báo crawl job:** nếu set `DISCORD_WEBHOOK_URL`, bạn sẽ nhận tin nhắn
   Discord khi: (a) toàn bộ category crawl lỗi trong 1 lần chạy, hoặc (b) 1
-  category còn dưới 5 ảnh khả dụng (sắp phải fallback cào trực tiếp liên tục).
+  category còn dưới 5 ảnh khả dụng (sắp hết ảnh trước lần crawl kế tiếp).
 - **Kênh log Discord (`LOG_CHANNEL_ID`):** nếu set, mọi `logger.warning()` /
-  `logger.error()` trong `bot.py` (lỗi DB, lỗi Pinterest, lỗi đồng bộ lệnh,
-  ảnh chậm bất thường...) tự động được gửi vào kênh này — kèm icon 🟡
-  (warning) / 🔴 (error) — ngoài việc vẫn in ra Render logs như bình thường.
-  Đây là kênh riêng cho vận hành/debug, khác với `DISCORD_WEBHOOK_URL` (chỉ
-  dành cho crawl job).
+  `logger.error()` trong `bot.py` (lỗi DB, lỗi đồng bộ lệnh, ảnh chậm bất
+  thường...) tự động được gửi vào kênh này — kèm icon 🟡 (warning) / 🔴
+  (error) — ngoài việc vẫn in ra Railway logs như bình thường. Đây là kênh
+  riêng cho vận hành/debug, khác với `DISCORD_WEBHOOK_URL` (chỉ dành cho
+  crawl job).
 - **Heartbeat ping (`LOG_CHANNEL_ID`):** bot gửi 1 embed "Bot đang hoạt động"
   kèm độ trễ vào kênh log ngay lúc khởi động, rồi lặp lại mỗi 10 phút. Mỗi
   lần gửi ping mới, tin ping CŨ sẽ bị xoá trước — kênh log chỉ luôn có đúng 1
   tin ping mới nhất, không bị trôi bởi hàng loạt tin ping cũ.
 - **Hiệu năng lấy ảnh:** mỗi lần `/img`/`/random` lấy ảnh, bot đo thời gian
-  đọc MongoDB và thời gian fallback cào Pinterest (nếu có), tự cảnh báo (và
-  gửi vào kênh log nếu bật) khi bước nào đó chậm bất thường (> 3s cho DB,
-  > 15s cho fallback Pinterest) — giúp xác định chỗ nghẽn khi bot phản hồi
-  chậm. Category (bao gồm cả category admin thêm qua Discord) được cache 30
-  giây để giảm số lần truy vấn MongoDB lặp lại không cần thiết.
+  đọc MongoDB, tự cảnh báo (và gửi vào kênh log nếu bật) nếu chậm bất
+  thường (> 3s) — giúp xác định chỗ nghẽn khi bot phản hồi chậm. Category
+  (bao gồm cả category admin thêm qua Discord) được cache 30 giây để giảm
+  số lần truy vấn MongoDB lặp lại không cần thiết.
 - **Log chậm cho MỌI lệnh MongoDB (`db.py`):** ngoài phần đo riêng cho
   `/img`/`/random` ở trên, mọi hàm trong `db.py` (kể cả những chỗ chưa có đo
   riêng như đọc showcase board, đọc config server...) đều tự động log
@@ -280,11 +276,14 @@ nửa phút) từng khiến ứng dụng tự báo "không phản hồi kịp th
 
 ## Deploy
 
-- **Bot**: Render, loại **Web Service**. Start Command được set trực tiếp
-  trong Render dashboard (`python3 bot.py`) — **Render không đọc `procfile`**
-  (đã xác nhận thực tế), file này chỉ mang tính tài liệu/tương thích ngược,
-  không ảnh hưởng gì tới runtime. `keep_alive.py` mở server Flask ở `$PORT`
-  để giữ bot thức trên free-tier + phục vụ endpoint `/health`.
+- **Bot**: Railway. Tự nhận diện `Procfile` (`web: python3 bot.py`) qua
+  Railpack (builder mặc định của Railway) — lưu ý tên file phải viết hoa
+  chữ P (`Procfile`), viết thường (`procfile`) sẽ không được nhận diện,
+  khiến Railway tự đoán sai thành `gunicorn main:app` và crash. Trước đây
+  bot chạy trên Render (Start Command set thủ công trong dashboard, không
+  đọc `Procfile`) — đã chuyển hẳn sang Railway vì CPU ổn định hơn nhiều so
+  với gói Free của Render (chỉ 0.1 vCPU cố định). `keep_alive.py` mở server
+  Flask ở `$PORT` (Railway tự cấp) để phục vụ endpoint `/health` + `/`.
 - **Crawl job**: GitHub Actions, tự chạy theo lịch cron trong
   `.github/workflows/main.yml` (mặc định mỗi 2 tiếng), hoặc trigger thủ công
   qua tab Actions (`workflow_dispatch`). Lưu ý: GitHub Actions cron chỉ chạy
