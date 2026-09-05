@@ -268,6 +268,27 @@ async def _before_heartbeat_ping():
 async def on_ready():
     global _persistent_view_ready
     logger.info(f"Bot đã đăng nhập thành công với tên: {bot.user}")
+
+    # Làm nóng kết nối MongoDB ngay lúc khởi động, chạy NỀN (không await ở
+    # đây, không chặn các bước bên dưới). Lý do: get_db() lần gọi ĐẦU TIÊN
+    # sau khi restart phải làm TLS handshake + tra cứu SRV DNS của Atlas,
+    # từng đo được mất tới 3+ giây (xem log "[Mongo chậm] get_db mất 3068ms").
+    # Nếu không làm nóng trước, chi phí 3 giây này sẽ rơi đúng vào request
+    # Mongo đầu tiên nào đó — thường là ngay khi có người bấm nút ngay sau
+    # khi vừa deploy xong — khiến dù code đã defer() đúng thứ tự vẫn có thể
+    # timeout, vì bản thân việc lấy connection (chạy trong executor thread)
+    # có thể làm event loop khựng lại đủ lâu để defer() gửi không kịp.
+    async def _warmup_mongo():
+        start = time.monotonic()
+        try:
+            await bot.loop.run_in_executor(None, db.get_db)
+            elapsed = time.monotonic() - start
+            logger.info(f"Đã làm nóng kết nối MongoDB lúc khởi động ({elapsed:.1f}s).")
+        except Exception as e:
+            logger.warning(f"Lỗi khi làm nóng kết nối MongoDB lúc khởi động: {e}")
+
+    asyncio.create_task(_warmup_mongo())
+
     try:
         synced = await bot.tree.sync()
         logger.info(f"Đã đồng bộ {len(synced)} slash command(s).")

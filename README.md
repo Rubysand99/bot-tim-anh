@@ -261,6 +261,12 @@ timeout mỗi lần. Sau 5 phút tự thử lại bình thường. Trạng thái
   Atlas/độ trễ mạng có phải nguyên nhân khi nghi ngờ bot bị timeout, thay vì
   đoán mò. Hàm nhanh (đa số trường hợp bình thường) không log gì cả, tránh
   làm ồn log.
+- **Làm nóng kết nối MongoDB lúc khởi động:** kết nối Mongo lần đầu sau khi
+  restart tốn 3+ giây (TLS handshake + tra cứu SRV DNS của Atlas) — nếu để
+  xảy ra lười biếng lúc có người bấm nút đầu tiên, dễ gây timeout "không
+  phản hồi kịp thời" dù code đã `defer()` đúng thứ tự. Bot tự làm nóng kết
+  nối này ngay trong `on_ready()` (chạy nền, không chặn các bước khởi động
+  khác), log "Đã làm nóng kết nối MongoDB..." xác nhận xong.
 - **Backup MongoDB:** không nằm trong code — bật ở phía MongoDB Atlas
   (Atlas → cluster → Backup) nếu cần, Atlas hỗ trợ backup tự động định kỳ.
 

@@ -4,5 +4,5 @@ Số bản của bot — cập nhật mỗi khi thêm tính năng/sửa lỗi đ
 Chỉ cần sửa 2 biến bên dưới, không cần đụng vào bot.py.
 """
 
-__version__ = "1.3.2"
-__description__ = "Sửa cùng lỗi defer() gọi muộn ở 2 chỗ khác: nút Trước/Sau (_paginator_navigate) và nút Lưu ảnh — cả 2 đều gọi DB trước khi defer(), có thể gây 'không phản hồi kịp thời' nếu Mongo chậm."
+__version__ = "1.4.0"
+__description__ = "Làm nóng kết nối MongoDB ngay lúc bot khởi động (chạy nền) — log xác nhận get_db() lần đầu sau restart từng mất 3+ giây, gây timeout nút bấm nếu user thao tác ngay sau khi vừa deploy. Giờ chi phí này trả trước lúc khởi động, không còn rơi vào lúc user đang chờ phản hồi."
