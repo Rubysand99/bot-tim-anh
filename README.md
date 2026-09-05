@@ -151,10 +151,13 @@ chủ đề cùng lúc theo 2 bước:
 2. **Gán kênh cho từng chủ đề:** bot lần lượt hỏi từng chủ đề đã chọn —
    chọn 1 kênh có sẵn từ dropdown kênh, hoặc bấm **"➕ Tạo kênh mới"** (mở
    form nhập tên, đã điền sẵn tên chủ đề — sửa lại tuỳ ý trước khi tạo).
-   Kênh mới tạo được gom vào 1 category kênh chung tên **"📸 Ảnh chủ đề"**
-   (tự tạo lần đầu, các lần `/setup` sau tái sử dụng lại category này thay
-   vì tạo trùng — đổi tên category ở constant `SETUP_CHANNEL_CATEGORY_NAME`
-   trong `bot.py` nếu muốn).
+   Muốn nhanh gọn, bấm **"🚀 Tạo tất cả kênh còn lại"** để bot tự tạo kênh
+   mới (tên = tên chủ đề) cho toàn bộ các chủ đề còn lại trong hàng đợi
+   cùng lúc, không cần lặp lại thao tác cho từng chủ đề. Kênh mới tạo
+   (dù tạo từng cái hay tạo tất cả) được gom vào 1 category kênh chung
+   tên **"📸 Ảnh chủ đề"** (tự tạo lần đầu, các lần `/setup` sau tái sử
+   dụng lại category này thay vì tạo trùng — đổi tên category ở constant
+   `SETUP_CHANNEL_CATEGORY_NAME` trong `bot.py` nếu muốn).
 
 Sau khi gán đủ kênh cho tất cả chủ đề đã chọn, bot tự động đăng showcase
 board (giống `/showcase`) vào đúng kênh tương ứng cho từng chủ đề, rồi báo

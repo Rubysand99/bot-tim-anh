@@ -1515,11 +1515,14 @@ class ChannelAssignWizard:
     async def _prompt_current(self, interaction: discord.Interaction):
         key, info = self.categories[self.index]
         view = ChannelPickerView(self, key, info)
+        remaining = len(self.categories) - self.index
         embed = discord.Embed(
             title=f"📌 Chọn kênh cho: {info['label']}",
             description=(
                 f"Chủ đề {self.index + 1}/{len(self.categories)} (`{key}`)\n\n"
-                "Chọn 1 kênh có sẵn ở dropdown bên dưới, hoặc bấm **➕ Tạo kênh mới**."
+                "Chọn 1 kênh có sẵn ở dropdown bên dưới, hoặc bấm **➕ Tạo kênh mới**.\n\n"
+                f"Muốn nhanh gọn? Bấm **🚀 Tạo tất cả kênh còn lại** để bot tự tạo "
+                f"kênh mới (tên = tên chủ đề) cho cả {remaining} chủ đề còn lại cùng lúc."
             ),
             color=discord.Color.blurple(),
         )
@@ -1536,9 +1539,39 @@ class ChannelAssignWizard:
 
         await self._prompt_current(interaction)
 
-    async def _finish(self, interaction: discord.Interaction):
+    async def create_all_remaining(self, interaction: discord.Interaction):
+        """
+        Tự tạo kênh mới (tên = label chủ đề) cho TẤT CẢ chủ đề còn lại trong
+        hàng đợi (kể cả chủ đề đang hiện ở bước này), gom vào category kênh
+        chung, rồi kết thúc wizard luôn — bỏ qua việc hỏi từng chủ đề một.
+        Dùng defer() vì có thể tạo nhiều kênh liên tiếp, tốn hơn 3 giây.
+        """
+        await interaction.response.defer()
+
+        remaining = self.categories[self.index:]
+        setup_category, cat_error = await _ensure_setup_channel_category(interaction.guild)
+        if cat_error:
+            logger.warning(f"/setup (tạo tất cả kênh) không gom được vào category kênh chung: {cat_error}")
+
+        error_lines = []
+        for key, info in remaining:
+            try:
+                new_channel = await interaction.guild.create_text_channel(name=info["label"][:90], category=setup_category)
+            except discord.Forbidden:
+                error_lines.append(f"❌ **{info['label']}**: bot không có quyền tạo kênh, bỏ qua.")
+                continue
+            except Exception as e:
+                logger.warning(f"Lỗi tạo kênh cho `{key}` trong /setup (tạo tất cả): {e}")
+                error_lines.append(f"❌ **{info['label']}**: lỗi khi tạo kênh, bỏ qua.")
+                continue
+            self.assignments[key] = new_channel.id
+
+        self.index = len(self.categories)
+        await self._finish(interaction, extra_lines=error_lines)
+
+    async def _finish(self, interaction: discord.Interaction, extra_lines: list = None):
         all_cats = await get_all_categories_async()
-        lines = []
+        lines = list(extra_lines) if extra_lines else []
         for key, channel_id in self.assignments.items():
             info = all_cats.get(key)
             channel = interaction.guild.get_channel(channel_id) if interaction.guild else None
@@ -1559,7 +1592,12 @@ class ChannelAssignWizard:
             description="\n".join(lines) if lines else "(không có chủ đề nào được xử lý)",
             color=discord.Color.green(),
         )
-        await interaction.response.edit_message(embed=embed, view=None)
+        # create_all_remaining() đã defer() trước đó (response is_done), nên
+        # phải sửa qua edit_original_response thay vì response.edit_message.
+        if interaction.response.is_done():
+            await interaction.edit_original_response(embed=embed, view=None)
+        else:
+            await interaction.response.edit_message(embed=embed, view=None)
 
 
 class NewChannelModal(discord.ui.Modal):
@@ -1614,6 +1652,7 @@ class ChannelPickerView(discord.ui.View):
             channel_types=[discord.ChannelType.text],
             min_values=1,
             max_values=1,
+            row=0,
         )
         channel_select.callback = self._on_channel_selected
         self.channel_select = channel_select
@@ -1633,9 +1672,13 @@ class ChannelPickerView(discord.ui.View):
             return
         await self.wizard.advance(interaction, real_channel)
 
-    @discord.ui.button(label="➕ Tạo kênh mới", style=discord.ButtonStyle.primary)
+    @discord.ui.button(label="➕ Tạo kênh mới", style=discord.ButtonStyle.primary, row=1)
     async def create_channel_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.send_modal(NewChannelModal(self.wizard, self.category_key, self.info))
+
+    @discord.ui.button(label="🚀 Tạo tất cả kênh còn lại", style=discord.ButtonStyle.success, row=1)
+    async def create_all_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self.wizard.create_all_remaining(interaction)
 
 
 class CategoryPickerView(discord.ui.View):

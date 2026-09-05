@@ -4,5 +4,5 @@ Số bản của bot — cập nhật mỗi khi thêm tính năng/sửa lỗi đ
 Chỉ cần sửa 2 biến bên dưới, không cần đụng vào bot.py.
 """
 
-__version__ = "1.1.0"
-__description__ = "/setup: tạo kênh mới giờ điền sẵn tên = tên chủ đề, và tự gom các kênh mới vào 1 category kênh chung 'Ảnh chủ đề' (tái sử dụng, không tạo trùng)."
+__version__ = "1.2.0"
+__description__ = "/setup: thêm nút '🚀 Tạo tất cả kênh còn lại' để tự tạo kênh (tên = tên chủ đề) cho toàn bộ chủ đề còn lại trong 1 lần bấm, thay vì lặp qua từng chủ đề."
