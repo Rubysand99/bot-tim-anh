@@ -5,11 +5,36 @@ Dùng chung Atlas cluster với Rudeus Bot, nhưng tách riêng database
 "pinterest_bot" để không đụng vào dữ liệu của bot kia.
 """
 
+import functools
+import logging
 import os
+import time
 from datetime import datetime, timedelta, timezone
 
 from pymongo import MongoClient, ASCENDING, ReturnDocument
 from pymongo.errors import DuplicateKeyError
+
+logger = logging.getLogger("db")
+
+# Ngưỡng (ms) để coi 1 lệnh Mongo là "chậm" và log cảnh báo — giúp chẩn đoán
+# khi nghi ngờ MongoDB Atlas (hoặc độ trễ mạng Render<->Atlas) là nguyên nhân
+# timeout/lag ở bot, thay vì đoán mò. Chỉnh số này nếu thấy log ồn quá hoặc
+# muốn bắt cả những lệnh chỉ hơi chậm.
+SLOW_QUERY_THRESHOLD_MS = 500
+
+
+def _timed(func):
+    """Đo thời gian chạy 1 hàm DB, log WARNING nếu vượt ngưỡng SLOW_QUERY_THRESHOLD_MS."""
+    @functools.wraps(func)
+    def wrapper(*args, **kwargs):
+        start = time.monotonic()
+        try:
+            return func(*args, **kwargs)
+        finally:
+            elapsed_ms = (time.monotonic() - start) * 1000
+            if elapsed_ms >= SLOW_QUERY_THRESHOLD_MS:
+                logger.warning(f"[Mongo chậm] {func.__name__} mất {elapsed_ms:.0f}ms")
+    return wrapper
 
 DB_NAME = "pinterest_bot"
 COLLECTION_NAME = "images"
@@ -27,6 +52,7 @@ def now_utc() -> datetime:
     return datetime.now(timezone.utc)
 
 
+@_timed
 def get_db():
     """Lazy-connect, chỉ tạo connection 1 lần rồi tái sử dụng."""
     global _client, _db
@@ -62,6 +88,7 @@ def _available_query(category: str = None, exclude_urls: list = None) -> dict:
     return query
 
 
+@_timed
 def _mark_sent(doc_id) -> None:
     db = get_db()
     db[COLLECTION_NAME].update_one(
@@ -70,6 +97,7 @@ def _mark_sent(doc_id) -> None:
     )
 
 
+@_timed
 def get_next_image(category: str, exclude_urls: list):
     """
     Lấy NGẪU NHIÊN 1 ảnh khả dụng trong category (chưa từng gửi hoặc đã gửi
@@ -96,6 +124,7 @@ def get_next_image(category: str, exclude_urls: list):
     return doc
 
 
+@_timed
 def get_random_image(exclude_urls: list = None, category_keys: list = None):
     """
     Lấy NGẪU NHIÊN 1 ảnh khả dụng bất kỳ CATEGORY NÀO (dùng cho /random —
@@ -129,17 +158,20 @@ def get_random_image(exclude_urls: list = None, category_keys: list = None):
     return doc
 
 
+@_timed
 def count_images(category: str) -> int:
     db = get_db()
     return db[COLLECTION_NAME].count_documents({"category": category})
 
 
+@_timed
 def count_available_images(category: str) -> int:
     """Đếm ảnh KHẢ DỤNG ngay bây giờ (chưa gửi hoặc đã qua cooldown 1 tiếng)."""
     db = get_db()
     return db[COLLECTION_NAME].count_documents(_available_query(category=category))
 
 
+@_timed
 def get_category_stats(category: str) -> dict:
     """Thống kê chi tiết 1 category: tổng, khả dụng, TB số lần gửi, ảnh cũ/mới nhất."""
     db = get_db()
@@ -187,6 +219,7 @@ def get_category_stats(category: str) -> dict:
 # merge với CATEGORIES tĩnh ở tầng bot.py.
 # ============================================================
 
+@_timed
 def get_custom_categories() -> dict:
     db = get_db()
     docs = db[CUSTOM_CATEGORIES_COLLECTION].find({})
@@ -196,11 +229,13 @@ def get_custom_categories() -> dict:
     }
 
 
+@_timed
 def custom_category_exists(slug: str) -> bool:
     db = get_db()
     return db[CUSTOM_CATEGORIES_COLLECTION].count_documents({"_id": slug}) > 0
 
 
+@_timed
 def add_custom_category(slug: str, label: str, keyword: str, nsfw: bool = False) -> None:
     db = get_db()
     db[CUSTOM_CATEGORIES_COLLECTION].update_one(
@@ -210,6 +245,7 @@ def add_custom_category(slug: str, label: str, keyword: str, nsfw: bool = False)
     )
 
 
+@_timed
 def edit_custom_category(slug: str, label: str = None, keyword: str = None, nsfw: bool = None) -> bool:
     """Sửa label/keyword/nsfw của 1 category CUSTOM đã tồn tại. Trả về False nếu chưa từng thêm qua lệnh."""
     db = get_db()
@@ -228,6 +264,7 @@ def edit_custom_category(slug: str, label: str = None, keyword: str = None, nsfw
     return True
 
 
+@_timed
 def remove_custom_category(slug: str) -> bool:
     """Trả về True nếu xoá được (category tồn tại và là custom)."""
     db = get_db()
@@ -240,12 +277,14 @@ def remove_custom_category(slug: str) -> bool:
 # việc tự crawl ngay category mới thêm nếu đã lâu chưa có lần crawl nào).
 # ============================================================
 
+@_timed
 def get_last_crawl_time():
     db = get_db()
     doc = db[META_COLLECTION].find_one({"_id": "last_crawl"})
     return doc["at"] if doc else None
 
 
+@_timed
 def set_last_crawl_time() -> None:
     db = get_db()
     db[META_COLLECTION].update_one(
@@ -261,6 +300,7 @@ def set_last_crawl_time() -> None:
 # (không phụ thuộc bộ nhớ RAM của tiến trình bot).
 # ============================================================
 
+@_timed
 def save_paginator_session(message_id: str, category_key: str, label: str, keyword: str,
                             images: list, index: int, author_id: int) -> None:
     db = get_db()
@@ -279,11 +319,13 @@ def save_paginator_session(message_id: str, category_key: str, label: str, keywo
     )
 
 
+@_timed
 def get_paginator_session(message_id: str):
     db = get_db()
     return db[PAGINATOR_SESSIONS_COLLECTION].find_one({"_id": message_id})
 
 
+@_timed
 def update_paginator_session(message_id: str, images: list, index: int) -> None:
     db = get_db()
     db[PAGINATOR_SESSIONS_COLLECTION].update_one(
@@ -296,6 +338,7 @@ def update_paginator_session(message_id: str, images: list, index: int) -> None:
 # Dọn dẹp kho ảnh
 # ============================================================
 
+@_timed
 def delete_overused_images(category: str, min_sent_count: int) -> int:
     """Xoá ảnh đã bị gửi >= min_sent_count lần trong category. Trả về số đã xoá."""
     db = get_db()
@@ -306,11 +349,13 @@ def delete_overused_images(category: str, min_sent_count: int) -> int:
     return result.deleted_count
 
 
+@_timed
 def get_all_image_urls(category: str) -> list:
     db = get_db()
     return [d["image_url"] for d in db[COLLECTION_NAME].find({"category": category}, {"image_url": 1})]
 
 
+@_timed
 def delete_images_by_url(urls: list) -> int:
     if not urls:
         return 0
@@ -326,6 +371,7 @@ def delete_images_by_url(urls: list) -> int:
 # paginator_sessions), không cần nhúng dữ liệu vào custom_id.
 # ============================================================
 
+@_timed
 def save_showcase_board(message_id: str, category_key: str) -> None:
     db = get_db()
     db[SHOWCASE_BOARDS_COLLECTION].update_one(
@@ -335,6 +381,7 @@ def save_showcase_board(message_id: str, category_key: str) -> None:
     )
 
 
+@_timed
 def get_showcase_board(message_id: str):
     db = get_db()
     return db[SHOWCASE_BOARDS_COLLECTION].find_one({"_id": message_id})
@@ -347,6 +394,7 @@ def get_showcase_board(message_id: str):
 # server bot có mặt.
 # ============================================================
 
+@_timed
 def get_guild_config(guild_id: int) -> dict:
     """Trả về {"allowed_channel_ids": [...], "allowed_role_ids": [...]}. Rỗng nếu server chưa cấu hình gì."""
     db = get_db()
@@ -359,6 +407,7 @@ def get_guild_config(guild_id: int) -> dict:
     }
 
 
+@_timed
 def add_guild_allowed_channel(guild_id: int, channel_id: int) -> None:
     db = get_db()
     db[GUILD_CONFIGS_COLLECTION].update_one(
@@ -366,11 +415,13 @@ def add_guild_allowed_channel(guild_id: int, channel_id: int) -> None:
     )
 
 
+@_timed
 def remove_guild_allowed_channel(guild_id: int, channel_id: int) -> None:
     db = get_db()
     db[GUILD_CONFIGS_COLLECTION].update_one({"_id": guild_id}, {"$pull": {"allowed_channel_ids": channel_id}})
 
 
+@_timed
 def clear_guild_allowed_channels(guild_id: int) -> None:
     db = get_db()
     db[GUILD_CONFIGS_COLLECTION].update_one(
@@ -378,6 +429,7 @@ def clear_guild_allowed_channels(guild_id: int) -> None:
     )
 
 
+@_timed
 def add_guild_allowed_role(guild_id: int, role_id: int) -> None:
     db = get_db()
     db[GUILD_CONFIGS_COLLECTION].update_one(
@@ -385,11 +437,13 @@ def add_guild_allowed_role(guild_id: int, role_id: int) -> None:
     )
 
 
+@_timed
 def remove_guild_allowed_role(guild_id: int, role_id: int) -> None:
     db = get_db()
     db[GUILD_CONFIGS_COLLECTION].update_one({"_id": guild_id}, {"$pull": {"allowed_role_ids": role_id}})
 
 
+@_timed
 def clear_guild_allowed_roles(guild_id: int) -> None:
     db = get_db()
     db[GUILD_CONFIGS_COLLECTION].update_one(
@@ -403,12 +457,14 @@ def clear_guild_allowed_roles(guild_id: int) -> None:
 # dụng, không tạo trùng nhiều category kênh mỗi lần chạy /setup.
 # ============================================================
 
+@_timed
 def get_guild_setup_category_id(guild_id: int):
     db = get_db()
     doc = db[GUILD_CONFIGS_COLLECTION].find_one({"_id": guild_id})
     return doc.get("setup_category_id") if doc else None
 
 
+@_timed
 def set_guild_setup_category_id(guild_id: int, category_id: int) -> None:
     db = get_db()
     db[GUILD_CONFIGS_COLLECTION].update_one(

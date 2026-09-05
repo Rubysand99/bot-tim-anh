@@ -253,6 +253,14 @@ timeout mỗi lần. Sau 5 phút tự thử lại bình thường. Trạng thái
   > 15s cho fallback Pinterest) — giúp xác định chỗ nghẽn khi bot phản hồi
   chậm. Category (bao gồm cả category admin thêm qua Discord) được cache 30
   giây để giảm số lần truy vấn MongoDB lặp lại không cần thiết.
+- **Log chậm cho MỌI lệnh MongoDB (`db.py`):** ngoài phần đo riêng cho
+  `/img`/`/random` ở trên, mọi hàm trong `db.py` (kể cả những chỗ chưa có đo
+  riêng như đọc showcase board, đọc config server...) đều tự động log
+  `WARNING` nếu lệnh Mongo đó chạy quá 500ms — chỉnh ngưỡng ở hằng số
+  `SLOW_QUERY_THRESHOLD_MS` đầu file `db.py`. Dùng để xác nhận MongoDB
+  Atlas/độ trễ mạng có phải nguyên nhân khi nghi ngờ bot bị timeout, thay vì
+  đoán mò. Hàm nhanh (đa số trường hợp bình thường) không log gì cả, tránh
+  làm ồn log.
 - **Backup MongoDB:** không nằm trong code — bật ở phía MongoDB Atlas
   (Atlas → cluster → Backup) nếu cần, Atlas hỗ trợ backup tự động định kỳ.
 
