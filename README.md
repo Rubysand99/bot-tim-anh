@@ -1,4 +1,4 @@
-# bot-tim-anh
+# bot-tim-anh.
 
 Bot Discord tìm/lấy ảnh theo chủ đề, dữ liệu được crawl sẵn từ Pinterest và
 lưu vào MongoDB, có fallback cào trực tiếp khi DB hết ảnh khả dụng.
