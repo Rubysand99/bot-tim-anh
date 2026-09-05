@@ -677,10 +677,19 @@ class ShowcaseStartView(discord.ui.View):
 
     @discord.ui.button(label="🎲 Bắt đầu", style=discord.ButtonStyle.primary, custom_id="showcase:start")
     async def start_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        # QUAN TRỌNG: defer() phải là việc ĐẦU TIÊN, trước mọi DB call/check
+        # bên dưới. Discord chỉ cho 3 giây để phản hồi ban đầu (kể cả defer);
+        # nếu Mongo chậm/chập chờn, 4 bước check phía dưới (get_showcase_board,
+        # get_all_categories_async, check_access...) cộng dồn có thể vượt 3
+        # giây, khiến Discord huỷ interaction ("không phản hồi kịp thời")
+        # trước khi code kịp defer. Defer trước rồi mới check sẽ không còn
+        # giới hạn 3 giây nữa (chỉ còn giới hạn 15 phút của followup).
+        await interaction.response.defer(ephemeral=True)
+
         message_id = str(interaction.message.id)
         board = await bot.loop.run_in_executor(None, db.get_showcase_board, message_id)
         if not board:
-            await interaction.response.send_message(
+            await interaction.followup.send(
                 "❌ Bảng giới thiệu này thiếu dữ liệu (có thể tạo từ bản bot cũ), không dùng được nữa.",
                 ephemeral=True,
             )
@@ -690,10 +699,10 @@ class ShowcaseStartView(discord.ui.View):
         all_cats = await get_all_categories_async()
         info = all_cats.get(category_key)
         if not info:
-            await interaction.response.send_message("❌ Chủ đề này không còn tồn tại nữa.", ephemeral=True)
+            await interaction.followup.send("❌ Chủ đề này không còn tồn tại nữa.", ephemeral=True)
             return
         if info.get("nsfw") and not _channel_allows_nsfw(interaction.channel):
-            await interaction.response.send_message(
+            await interaction.followup.send(
                 "🔞 Chủ đề này chỉ dùng được ở kênh đã đánh dấu Age-Restricted (NSFW).", ephemeral=True
             )
             return
@@ -701,15 +710,14 @@ class ShowcaseStartView(discord.ui.View):
         roles = getattr(interaction.user, "roles", None)
         access_err = await check_access(interaction.user.id, interaction.guild_id, interaction.channel_id, roles)
         if access_err:
-            await interaction.response.send_message(access_err, ephemeral=True)
+            await interaction.followup.send(access_err, ephemeral=True)
             return
         wait = check_cooldown(interaction.user.id)
         if wait:
-            await interaction.response.send_message(f"⏳ Chờ thêm {wait}s rồi thử lại nhé.", ephemeral=True)
+            await interaction.followup.send(f"⏳ Chờ thêm {wait}s rồi thử lại nhé.", ephemeral=True)
             return
         mark_used(interaction.user.id)
 
-        await interaction.response.defer(ephemeral=True)
         url = await _fetch_next_image_url(category_key, info["keyword"], [])
         if not url:
             await interaction.followup.send(f"❌ Không tìm thấy ảnh nào cho chủ đề: **{info['label']}**", ephemeral=True)
