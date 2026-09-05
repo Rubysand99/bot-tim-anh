@@ -125,12 +125,22 @@ def search_pinterest_images(query: str, limit: int = 20, timeout: int = 10) -> l
     return image_urls
 
 
-def search_pinterest_images_with_retry(query: str, limit: int = 20, retries: int = 3) -> list:
-    """Bản có retry + backoff, dùng an toàn hơn trong bot (chạy trong executor)."""
+def search_pinterest_images_with_retry(query: str, limit: int = 20, retries: int = 2) -> list:
+    """
+    Bản có retry + backoff, dùng an toàn hơn trong bot (chạy trong executor).
+
+    QUAN TRỌNG về thời gian chờ: retries=2, timeout=7s/lần -> worst case
+    2*7 + 3 (nghỉ giữa 2 lần) = 17s. Trước đây retries=3, timeout=10s có
+    worst case lên tới 36 GIÂY — quá lâu để người dùng chờ 1 cú bấm nút,
+    và khiến ứng dụng Discord (đặc biệt bản mobile) có thể tự hiển thị lỗi
+    "không phản hồi kịp thời" dù bot vẫn đang xử lý bình thường phía sau,
+    do các nút bấm defer() không có chỉ báo "đang tải" trực quan như lệnh
+    slash command thông thường.
+    """
     last_error = None
     for attempt in range(retries):
         try:
-            images = search_pinterest_images(query, limit=limit)
+            images = search_pinterest_images(query, limit=limit, timeout=7)
             if images:
                 return images
             last_error = None
@@ -138,7 +148,7 @@ def search_pinterest_images_with_retry(query: str, limit: int = 20, retries: int
             last_error = err
 
         if attempt < retries - 1:
-            time.sleep(2 * (attempt + 1))
+            time.sleep(3)
 
     if last_error:
         raise last_error

@@ -467,7 +467,10 @@ async def _fetch_next_image_url(category_key: str, keyword: str, exclude_urls: l
 
     def fetch_crawl():
         try:
-            results = search_pinterest_images_with_retry(keyword, limit=20, retries=3)
+            # Không truyền retries riêng nữa -> dùng default mới (2 lần,
+            # worst case ~17s thay vì 36s) — xem ghi chú trong
+            # pinterest_crawler.search_pinterest_images_with_retry().
+            results = search_pinterest_images_with_retry(keyword, limit=20)
         except Exception as e:
             logger.warning(f"Lỗi fallback cào Pinterest: {e}")
             return None

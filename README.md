@@ -229,6 +229,14 @@ trong 5 phút, trả lời ngay "hết ảnh khả dụng" thay vì bắt ngư�
 timeout mỗi lần. Sau 5 phút tự thử lại bình thường. Trạng thái này được log
 (và gửi vào `LOG_CHANNEL_ID` nếu bật) khi circuit mở.
 
+**Thời gian chờ tối đa 1 lần fallback:** `search_pinterest_images_with_retry`
+thử tối đa 2 lần, mỗi lần timeout 7 giây, nghỉ 3 giây giữa 2 lần — worst
+case ~17 giây (trước đây là 3 lần × 10s + backoff tăng dần, tới 36 giây).
+Giảm xuống vì nút bấm (Trước/Sau, Bắt đầu...) sau khi `defer()` không có
+chỉ báo "đang tải" trực quan trên Discord mobile — im lặng quá lâu (gần
+nửa phút) từng khiến ứng dụng tự báo "không phản hồi kịp thời" dù bot vẫn
+đang xử lý bình thường phía sau và cuối cùng vẫn trả ảnh về được.
+
 ## Giám sát
 
 - **Health check:** `GET /health` trên URL Render của bot trả JSON
