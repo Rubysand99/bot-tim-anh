@@ -15,6 +15,7 @@ LƯU Ý QUAN TRỌNG:
 import json
 import random
 import time
+from urllib.parse import quote
 
 import requests
 
@@ -36,11 +37,15 @@ RESOLUTION_PRIORITY = ("orig", "736x", "564x", "474x", "236x")
 
 
 def _build_headers(query: str) -> dict:
+    # QUAN TRỌNG: header HTTP chỉ chấp nhận ASCII/latin-1 — query tiếng Việt
+    # có dấu (vd "cảnh đẹp", "học sinh") PHẢI được URL-encode bằng quote()
+    # trước khi nhét vào Referer, nếu không sẽ crash với
+    # "'latin-1' codec can't encode character..." ngay khi gửi request.
     return {
         "User-Agent": random.choice(USER_AGENTS),
         "Accept": "application/json, text/javascript, */*, q=0.01",
         "Accept-Language": "vi-VN,vi;q=0.9,en-US;q=0.8,en;q=0.7",
-        "Referer": f"{SEARCH_PAGE_URL}?q={query}",
+        "Referer": f"{SEARCH_PAGE_URL}?q={quote(query)}",
         "X-Requested-With": "XMLHttpRequest",
         "X-Pinterest-AppState": "active",
         "X-Pinterest-PWS-Handler": "www/search/[scope].js",
