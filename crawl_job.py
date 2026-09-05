@@ -4,10 +4,10 @@ Chạy định kỳ (qua GitHub Actions cron, xem .github/workflows/main.yml) đ
 crawl ảnh Pinterest theo từng category (categories.py + category admin thêm
 qua Discord, lưu trong MongoDB), lưu vào MongoDB.
 
-Bot (bot.py) ưu tiên đọc ảnh đã crawl sẵn ở đây trước, chỉ cào Pinterest
-trực tiếp khi DB hết ảnh khả dụng cho category đó (xem hàm
-_fetch_next_image_url trong bot.py) — giúp giảm hẳn tần suất gọi Pinterest
-trực tiếp và rủi ro bị chặn IP của Render.
+Bot (bot.py) chỉ đọc ảnh đã crawl sẵn ở đây — không tự cào Pinterest trực
+tiếp nữa (đã bỏ hẳn cơ chế fallback, xem README mục "Khi 1 category hết ảnh
+khả dụng"). Nếu 1 category hết ảnh giữa 2 lần crawl, bot báo user chờ tới
+lần crawl kế tiếp thay vì tự cào ngay.
 
 Biến môi trường tuỳ chọn:
     DISCORD_WEBHOOK_URL - nếu set, job sẽ gửi cảnh báo qua webhook này khi:
@@ -27,7 +27,15 @@ import requests
 from pymongo.errors import DuplicateKeyError
 
 from categories import CATEGORIES
-from db import get_db, COLLECTION_NAME, get_custom_categories, count_available_images, set_last_crawl_time
+from db import (
+    get_db,
+    COLLECTION_NAME,
+    get_custom_categories,
+    count_available_images,
+    set_last_crawl_time,
+    get_category_bookmark,
+    set_category_bookmark,
+)
 from pinterest_crawler import search_pinterest_images_with_retry
 
 logging.basicConfig(
@@ -68,11 +76,22 @@ def crawl_category(slug: str, keyword: str):
     db = get_db()
     collection = db[COLLECTION_NAME]
 
+    # Phân trang qua bookmark: tiếp tục đúng chỗ lần crawl TRƯỚC đã dừng lại,
+    # thay vì luôn lấy lại đúng trang đầu tiên (nguyên nhân chính khiến tỉ lệ
+    # ảnh trùng/skip tăng dần theo thời gian — đã xác nhận thực tế Pinterest
+    # có hỗ trợ bookmark qua test trên Termux, 09/2026). Khi Pinterest báo hết
+    # trang (bookmark trả về None), lần crawl sau tự quay lại trang đầu —
+    # lúc đó top kết quả thường đã đổi khác nên vẫn có ảnh mới, không lặp vô hạn.
+    bookmark = get_category_bookmark(slug)
     try:
-        image_urls = search_pinterest_images_with_retry(keyword, limit=IMAGES_PER_CATEGORY)
+        image_urls, next_bookmark = search_pinterest_images_with_retry(
+            keyword, limit=IMAGES_PER_CATEGORY, bookmark=bookmark
+        )
     except Exception as err:
         logger.warning(f"Lỗi crawl category '{slug}': {err}")
         return 0, 0, True
+
+    set_category_bookmark(slug, next_bookmark)
 
     inserted = 0
     skipped = 0

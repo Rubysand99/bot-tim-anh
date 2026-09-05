@@ -4,5 +4,5 @@ Số bản của bot — cập nhật mỗi khi thêm tính năng/sửa lỗi đ
 Chỉ cần sửa 2 biến bên dưới, không cần đụng vào bot.py.
 """
 
-__version__ = "1.5.0"
-__description__ = "Bot không còn cào Pinterest trực tiếp lúc user chờ nữa — chỉ lấy ảnh từ MongoDB (crawl_job.py chạy mỗi 2 tiếng qua GitHub Actions). Khi 1 chủ đề hết ảnh, báo rõ còn khoảng bao lâu tới lần crawl kế tiếp thay vì chỉ nói chung chung."
+__version__ = "1.6.0"
+__description__ = "crawl_job.py giờ dùng phân trang (bookmark) của Pinterest thay vì luôn lấy lại trang đầu tiên — giảm tỉ lệ ảnh trùng/skip tăng dần theo thời gian khi crawl nhiều lần cho cùng 1 category. Đã xác nhận thực tế field bookmark qua test trên Termux."
