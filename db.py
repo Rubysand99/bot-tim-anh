@@ -294,6 +294,31 @@ def set_last_crawl_time() -> None:
     )
 
 
+@_timed
+def get_category_bookmark(category_key: str):
+    """
+    Lấy bookmark Pinterest đã lưu cho category này (từ lần crawl trước) —
+    dùng để lấy TRANG TIẾP THEO thay vì luôn lặp lại trang đầu, giảm tỉ lệ
+    ảnh trùng (skip) tăng dần theo thời gian khi crawl nhiều lần cho cùng
+    1 category/keyword. Trả None nếu chưa từng crawl category này, hoặc
+    Pinterest đã báo hết trang (bookmark reset về đầu).
+    """
+    db = get_db()
+    doc = db[META_COLLECTION].find_one({"_id": f"bookmark_{category_key}"})
+    return doc["bookmark"] if doc else None
+
+
+@_timed
+def set_category_bookmark(category_key: str, bookmark) -> None:
+    """bookmark=None nghĩa là Pinterest đã hết trang -> lần crawl sau bắt đầu lại từ đầu."""
+    db = get_db()
+    db[META_COLLECTION].update_one(
+        {"_id": f"bookmark_{category_key}"},
+        {"$set": {"bookmark": bookmark, "updated_at": now_utc()}},
+        upsert=True,
+    )
+
+
 # ============================================================
 # Phiên xem ảnh (paginator session) — lưu trạng thái nút Trước/Sau theo
 # message_id để nút bấm hoạt động vĩnh viễn, kể cả sau khi bot restart

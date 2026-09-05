@@ -73,8 +73,27 @@ GitHub Actions Secret (không cần set trên Railway, chỉ `crawl_job.py` dùn
 ## Chạy crawl job thủ công (test local qua Termux)
 
 ```bash
-MONGO_URI="mongodb+srv://..." python crawl_job.py
+MONGO_URI="mongodb+srv://...ClusterName..." python crawl_job.py
 ```
+
+**Lưu ý Termux + `mongodb+srv://`:** nếu gặp lỗi `cannot open /etc/resolv.conf`,
+chạy trước 1 lần:
+```bash
+mkdir -p $PREFIX/etc
+echo "nameserver 8.8.8.8" > $PREFIX/etc/resolv.conf
+```
+
+## Phân trang Pinterest (bookmark)
+
+`crawl_job.py` lưu lại `bookmark` (con trỏ phân trang, MongoDB collection
+`meta`, `_id: "bookmark_<category_key>"`) sau mỗi lần crawl 1 category, và
+dùng lại nó ở lần crawl kế tiếp để lấy **trang tiếp theo** thay vì luôn lấy
+lại đúng trang đầu tiên. Nếu không làm vậy, crawl nhiều lần liên tiếp cho
+cùng 1 category/keyword sẽ ngày càng trùng nhiều (top kết quả Pinterest cho
+1 từ khóa cố định thay đổi rất chậm), tốn request mà không có ảnh mới tương
+xứng. Khi Pinterest báo hết trang (`bookmark == "-end-"`), bookmark lưu lại
+là `None` — lần crawl sau tự quay lại trang đầu (lúc đó top kết quả thường
+đã đổi khác nên vẫn có ảnh mới).
 
 ## Chạy bot local
 

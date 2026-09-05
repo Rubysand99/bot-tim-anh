@@ -52,7 +52,7 @@ def _build_headers(query: str) -> dict:
     }
 
 
-def _build_params(query: str) -> dict:
+def _build_params(query: str, bookmark: str = None) -> dict:
     options = {
         "applied_unified_filters": None,
         "appliedProductFilters": "---",
@@ -77,6 +77,16 @@ def _build_params(query: str) -> dict:
         "top_pin_id": None,
         "top_pin_ids": None,
     }
+    # QUAN TRỌNG - phân trang: nếu có bookmark từ lần gọi trước (lấy từ
+    # response["resource_response"]["bookmark"]), truyền vào đây để Pinterest
+    # trả về TRANG TIẾP THEO thay vì luôn lặp lại đúng trang đầu tiên. Đã xác
+    # nhận thực tế field này tồn tại và hoạt động (test qua Termux 09/2026).
+    # Không có phân trang -> crawl nhiều lần cho cùng 1 category/keyword sẽ
+    # luôn lấy lại gần như đúng bộ ảnh cũ, tỉ lệ trùng (skip) tăng dần theo
+    # thời gian dù DB càng lúc càng có nhiều ảnh.
+    if bookmark:
+        options["bookmarks"] = [bookmark]
+
     payload = {"options": options, "context": {}}
     return {
         "source_url": f"/search/pins/?q={query}",
@@ -85,29 +95,36 @@ def _build_params(query: str) -> dict:
     }
 
 
-def search_pinterest_images(query: str, limit: int = 20, timeout: int = 10) -> list:
+def search_pinterest_images(query: str, limit: int = 20, timeout: int = 10, bookmark: str = None) -> tuple:
     """
     Tìm ảnh trên Pinterest theo từ khóa.
 
-    Trả về: list[str] các URL ảnh (độ phân giải cao nhất có sẵn cho mỗi pin).
+    bookmark: nếu truyền vào (lấy từ bookmark trả về của lần gọi TRƯỚC), lấy
+    TRANG TIẾP THEO thay vì luôn lặp lại trang đầu tiên — quan trọng khi
+    crawl_job.py chạy nhiều lần cho cùng 1 category, tránh tỉ lệ trùng
+    (skip vì DuplicateKeyError) tăng dần theo thời gian.
+
+    Trả về: (list[str] URL ảnh, next_bookmark hoặc None nếu hết trang).
     Ném Exception nếu request lỗi mạng hoặc Pinterest đổi cấu trúc response
     (khi đó payload sẽ không còn key như code đang mong đợi).
     """
     session = requests.Session()
     session.headers.update(_build_headers(query))
 
-    response = session.get(BASE_URL, params=_build_params(query), timeout=timeout)
+    response = session.get(BASE_URL, params=_build_params(query, bookmark=bookmark), timeout=timeout)
     response.raise_for_status()
 
     payload = response.json()
-    results = (
-        payload.get("resource_response", {})
-        .get("data", {})
-        .get("results", [])
-    )
+    resource_response = payload.get("resource_response", {})
+    results = resource_response.get("data", {}).get("results", [])
+    # "-end-" là giá trị Pinterest trả khi đã hết trang, không phải bookmark
+    # thật để dùng tiếp — coi như None (không còn trang nào nữa).
+    next_bookmark = resource_response.get("bookmark")
+    if next_bookmark == "-end-":
+        next_bookmark = None
 
     if not results:
-        return []
+        return [], next_bookmark
 
     image_urls = []
     for pin in results:
@@ -122,10 +139,10 @@ def search_pinterest_images(query: str, limit: int = 20, timeout: int = 10) -> l
         if len(image_urls) >= limit:
             break
 
-    return image_urls
+    return image_urls, next_bookmark
 
 
-def search_pinterest_images_with_retry(query: str, limit: int = 20, retries: int = 2) -> list:
+def search_pinterest_images_with_retry(query: str, limit: int = 20, retries: int = 2, bookmark: str = None) -> tuple:
     """
     Bản có retry + backoff, dùng an toàn hơn trong bot (chạy trong executor).
 
@@ -136,13 +153,15 @@ def search_pinterest_images_with_retry(query: str, limit: int = 20, retries: int
     "không phản hồi kịp thời" dù bot vẫn đang xử lý bình thường phía sau,
     do các nút bấm defer() không có chỉ báo "đang tải" trực quan như lệnh
     slash command thông thường.
+
+    Trả về: (list[str] URL ảnh, next_bookmark hoặc None).
     """
     last_error = None
     for attempt in range(retries):
         try:
-            images = search_pinterest_images(query, limit=limit, timeout=7)
+            images, next_bookmark = search_pinterest_images(query, limit=limit, timeout=7, bookmark=bookmark)
             if images:
-                return images
+                return images, next_bookmark
             last_error = None
         except Exception as err:  # noqa: BLE001 - muốn bắt mọi lỗi để retry
             last_error = err
@@ -152,4 +171,4 @@ def search_pinterest_images_with_retry(query: str, limit: int = 20, retries: int
 
     if last_error:
         raise last_error
-    return []
+    return [], None
