@@ -684,7 +684,23 @@ class ShowcaseStartView(discord.ui.View):
         # giây, khiến Discord huỷ interaction ("không phản hồi kịp thời")
         # trước khi code kịp defer. Defer trước rồi mới check sẽ không còn
         # giới hạn 3 giây nữa (chỉ còn giới hạn 15 phút của followup).
-        await interaction.response.defer(ephemeral=True)
+        #
+        # Bọc try/except quanh defer(): nếu Discord đã huỷ interaction TRƯỚC
+        # khi defer() kịp gửi đi (token hết hạn/interaction "Unknown"), lỗi
+        # này vốn dĩ discord.py chỉ log ra console chung, không thấy trong
+        # kênh log riêng — log rõ ra đây để lần sau biết chính xác là lỗi gì
+        # (mạng chậm thật sự, hay Discord-side timing) thay vì đoán mò.
+        try:
+            await interaction.response.defer(ephemeral=True)
+        except discord.NotFound:
+            logger.warning(
+                "Nút 'Bắt đầu' (showcase): interaction đã hết hạn trước khi kịp defer() — "
+                "khả năng cao do độ trễ mạng/Discord tại thời điểm bấm, không phải lỗi code."
+            )
+            return
+        except Exception as e:
+            logger.warning(f"Nút 'Bắt đầu' (showcase): lỗi không xác định khi defer(): {e}")
+            return
 
         message_id = str(interaction.message.id)
         board = await bot.loop.run_in_executor(None, db.get_showcase_board, message_id)
