@@ -494,17 +494,35 @@ async def _send_image_result(send_func, category_key: str, label: str, keyword: 
 
 async def _paginator_navigate(interaction: discord.Interaction, direction: int, view: discord.ui.View):
     """Logic điều hướng dùng chung cho mọi nơi hiển thị ảnh có nút Trước/Sau (/img, /random, showcase)."""
+    # QUAN TRỌNG: defer() phải là việc ĐẦU TIÊN — trước cả db.get_paginator_session()
+    # bên dưới. Cùng 1 lỗi từng gặp ở nút "Bắt đầu": nếu Mongo chậm đúng lúc gọi
+    # get_paginator_session (trước khi kịp defer), tổng thời gian có thể vượt quá
+    # 3 giây Discord cho phép, gây "không phản hồi kịp thời" dù ảnh cuối cùng vẫn
+    # lấy được (thấy rõ trong log: ảnh gửi thành công lúc 13:42 nhưng lỗi timeout
+    # xảy ra ngay sau đó — khả năng cao là lúc bấm "Sau" tiếp theo).
+    # Vì đã defer() không điều kiện ngay từ đầu, mọi nhánh bên dưới đều phải dùng
+    # edit_original_response() thay vì response.edit_message() (không thể gọi
+    # response.edit_message() sau khi đã defer()).
+    try:
+        await interaction.response.defer()
+    except discord.NotFound:
+        logger.warning("Paginator Trước/Sau: interaction đã hết hạn trước khi kịp defer().")
+        return
+    except Exception as e:
+        logger.warning(f"Paginator Trước/Sau: lỗi không xác định khi defer(): {e}")
+        return
+
     message_id = str(interaction.message.id)
     session = await bot.loop.run_in_executor(None, db.get_paginator_session, message_id)
 
     if not session:
-        await interaction.response.send_message(
+        await interaction.followup.send(
             "⚠️ Không tìm thấy dữ liệu phiên xem ảnh này nữa. Dùng lại `/img` để bắt đầu phiên mới.",
             ephemeral=True,
         )
         return
     if interaction.user.id != session["author_id"]:
-        await interaction.response.send_message(
+        await interaction.followup.send(
             "⚠️ Bạn không thể điều khiển kết quả tìm kiếm của người khác.", ephemeral=True
         )
         return
@@ -515,18 +533,18 @@ async def _paginator_navigate(interaction: discord.Interaction, direction: int, 
     if direction < 0:
         index = max(0, index - 1)
         await bot.loop.run_in_executor(None, db.update_paginator_session, message_id, images, index)
-        await interaction.response.edit_message(embed=_build_image_embed(session["label"], images[index]), view=view)
+        await interaction.edit_original_response(embed=_build_image_embed(session["label"], images[index]), view=view)
         return
 
     # direction > 0 ("Sau"): còn ảnh đệm sẵn -> chuyển luôn
     if index < len(images) - 1:
         index += 1
         await bot.loop.run_in_executor(None, db.update_paginator_session, message_id, images, index)
-        await interaction.response.edit_message(embed=_build_image_embed(session["label"], images[index]), view=view)
+        await interaction.edit_original_response(embed=_build_image_embed(session["label"], images[index]), view=view)
         return
 
     # Hết ảnh đệm -> lấy ảnh mới (DB hoặc fallback Pinterest), có thể mất vài giây
-    await interaction.response.defer()
+    # (đã defer() từ đầu hàm nên không còn bị giới hạn 3 giây ở đây nữa)
     new_url = await _fetch_next_image_url(session["category_key"], session["keyword"], images)
     if not new_url:
         await interaction.followup.send(
@@ -610,18 +628,28 @@ class EphemeralImagePaginator(discord.ui.View):
 
     @discord.ui.button(label="💾 Lưu ảnh", style=discord.ButtonStyle.success, custom_id="epaginator:save")
     async def save_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        # Cùng nguyên tắc: defer() trước, mọi DB call sau — xem ghi chú ở
+        # _paginator_navigate() phía trên.
+        try:
+            await interaction.response.defer(ephemeral=True)
+        except discord.NotFound:
+            logger.warning("Nút 'Lưu ảnh': interaction đã hết hạn trước khi kịp defer().")
+            return
+        except Exception as e:
+            logger.warning(f"Nút 'Lưu ảnh': lỗi không xác định khi defer(): {e}")
+            return
+
         message_id = str(interaction.message.id)
         session = await bot.loop.run_in_executor(None, db.get_paginator_session, message_id)
         if not session:
-            await interaction.response.send_message("⚠️ Không tìm thấy dữ liệu ảnh này nữa.", ephemeral=True)
+            await interaction.followup.send("⚠️ Không tìm thấy dữ liệu ảnh này nữa.", ephemeral=True)
             return
         if interaction.user.id != session["author_id"]:
-            await interaction.response.send_message("⚠️ Bạn không thể lưu ảnh của người khác.", ephemeral=True)
+            await interaction.followup.send("⚠️ Bạn không thể lưu ảnh của người khác.", ephemeral=True)
             return
 
         url = session["images"][session["index"]]
         label = session["label"]
-        await interaction.response.defer(ephemeral=True)
 
         # Cố gắng lấy thêm thông tin ảnh (định dạng, dung lượng) qua HEAD request.
         # Không bắt buộc phải thành công — nếu lỗi/timeout thì bỏ qua, chỉ dùng ghi chú thường.
