@@ -4,5 +4,5 @@ Số bản của bot — cập nhật mỗi khi thêm tính năng/sửa lỗi đ
 Chỉ cần sửa 2 biến bên dưới, không cần đụng vào bot.py.
 """
 
-__version__ = "1.2.0"
-__description__ = "/setup: thêm nút '🚀 Tạo tất cả kênh còn lại' để tự tạo kênh (tên = tên chủ đề) cho toàn bộ chủ đề còn lại trong 1 lần bấm, thay vì lặp qua từng chủ đề."
+__version__ = "1.2.1"
+__description__ = "Tăng thời gian chờ sau khi bị Discord Rate Limit 429 từ 60 giây lên 5 phút, để tránh restart lặp lại liên tục gây downtime dài (ghi nhận qua UptimeRobot: 429 lặp vòng gây mất kết nối 15+ phút)."

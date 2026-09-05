@@ -1775,11 +1775,13 @@ if __name__ == "__main__":
         except discord.errors.HTTPException as e:
             if e.status == 429:
                 logger.warning(
-                    "Bị Discord Rate Limit 429 khi đăng nhập. Chờ 60 giây rồi "
+                    "Bị Discord Rate Limit 429 khi đăng nhập. Chờ 5 phút rồi "
                     "thoát tiến trình để Render tự khởi động lại (không retry "
-                    "trong cùng process vì session HTTP đã bị đóng)."
+                    "trong cùng process vì session HTTP đã bị đóng). Chờ lâu "
+                    "hơn 60 giây để tránh dính 429 lặp lại liên tục nếu giới "
+                    "hạn của Discord chưa được gỡ."
                 )
-                time.sleep(60)
+                time.sleep(300)
                 sys.exit(1)
             else:
                 raise
