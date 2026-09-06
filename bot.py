@@ -263,6 +263,90 @@ async def _before_heartbeat_ping():
     await bot.wait_until_ready()
 
 
+# ============================================================
+# Self-test soak: tự đăng 1 embed ảnh vào LOG_CHANNEL_ID lúc khởi động, rồi
+# mỗi 10 giây tự lấy ảnh tiếp theo (đúng hàm db.get_next_image mà nút
+# Trước/Sau thật dùng) và edit lại tin nhắn — KHÔNG qua interaction Discord
+# (bot không thể tự "bấm" nút của chính nó, message.edit() không có giới
+# hạn 3 giây như interaction). Mục đích: chạy dài hạn để phát hiện nếu
+# MongoDB thỉnh thoảng chậm/lỗi bất thường mà chỉ số liệu 1 lần không thấy
+# được — nếu có bất thường sẽ tự log WARNING (tự động hiện trong kênh này
+# luôn nhờ DiscordAlertHandler, không cần gửi tay).
+# ============================================================
+
+SELF_TEST_INTERVAL_SECONDS = 10
+SELF_TEST_SLOW_THRESHOLD_SECONDS = 1.0
+_self_test_message_id = None
+
+
+@tasks.loop(seconds=SELF_TEST_INTERVAL_SECONDS)
+async def self_test_loop():
+    global _self_test_message_id
+    if not LOG_CHANNEL_ID:
+        return
+
+    channel = bot.get_channel(LOG_CHANNEL_ID)
+    if channel is None:
+        try:
+            channel = await bot.fetch_channel(LOG_CHANNEL_ID)
+        except Exception as e:
+            logger.warning(f"[self-test] Không lấy được kênh log: {e}")
+            return
+
+    all_cats = await get_all_categories_async()
+    if not all_cats:
+        return
+    category_key, info = random.choice(list(all_cats.items()))
+
+    t0 = time.monotonic()
+    try:
+        # peek_random_image (KHÔNG phải get_next_image) — không đánh dấu
+        # last_sent_at, tránh tự động "dùng hết" ảnh thật của user. Xem
+        # ghi chú trong db.py.
+        doc = await bot.loop.run_in_executor(None, db.peek_random_image, category_key)
+    except Exception as e:
+        logger.warning(f"[self-test] Lỗi đọc MongoDB cho '{category_key}': {e}")
+        return
+    fetch_elapsed = time.monotonic() - t0
+
+    if fetch_elapsed >= SELF_TEST_SLOW_THRESHOLD_SECONDS:
+        logger.warning(f"[self-test] Đọc MongoDB cho '{category_key}' chậm bất thường: {fetch_elapsed:.2f}s")
+
+    if not doc:
+        # Category này đang không có ảnh nào -> bỏ qua vòng này, thử category
+        # khác ở lần lặp sau, không phải lỗi thật.
+        return
+    url = doc["image_url"]
+
+    embed = _build_image_embed(f"[self-test] {info['label']}", url)
+    embed.set_footer(text=f"Nguồn: kho ảnh đã crawl sẵn · fetch {fetch_elapsed*1000:.0f}ms")
+
+    t1 = time.monotonic()
+    try:
+        if _self_test_message_id:
+            try:
+                msg = await channel.fetch_message(_self_test_message_id)
+                await msg.edit(embed=embed)
+            except discord.NotFound:
+                msg = await channel.send(embed=embed)
+                _self_test_message_id = msg.id
+        else:
+            msg = await channel.send(embed=embed)
+            _self_test_message_id = msg.id
+    except Exception as e:
+        logger.warning(f"[self-test] Lỗi gửi/sửa tin nhắn: {e}")
+        return
+    edit_elapsed = time.monotonic() - t1
+
+    if edit_elapsed >= SELF_TEST_SLOW_THRESHOLD_SECONDS:
+        logger.warning(f"[self-test] Gửi/sửa tin nhắn Discord chậm bất thường: {edit_elapsed:.2f}s")
+
+
+@self_test_loop.before_loop
+async def _before_self_test_loop():
+    await bot.wait_until_ready()
+
+
 @bot.event
 async def on_ready():
     global _persistent_view_ready
@@ -301,6 +385,8 @@ async def on_ready():
         logger.info("Đã đăng ký các persistent view (nút ảnh + showcase) — hoạt động cả sau khi bot restart.")
     if not heartbeat_ping.is_running():
         heartbeat_ping.start()  # tự gửi ping ngay lần đầu, sau đó lặp lại mỗi 10 phút
+    if not self_test_loop.is_running():
+        self_test_loop.start()  # soak-test tự động, lặp mỗi 10 giây (xem ghi chú ở định nghĩa)
     logger.info("------------------------------------------")
 
 

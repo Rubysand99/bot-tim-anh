@@ -124,6 +124,37 @@ def get_next_image(category: str, exclude_urls: list):
     return doc
 
 
+    doc = results[0]
+    _mark_sent(doc["_id"])
+    doc["last_sent_at"] = now_utc()
+    doc["sent_count"] = doc.get("sent_count", 0) + 1
+    return doc
+
+
+@_timed
+def peek_random_image(category: str):
+    """
+    Giống get_next_image() nhưng KHÔNG đánh dấu last_sent_at/sent_count —
+    dùng riêng cho self-test/soak-test (bot tự đọc DB định kỳ mỗi 10s để đo
+    hiệu năng MongoDB, xem self_test_loop trong bot.py). Nếu dùng get_next_image
+    cho việc này, tự động gọi liên tục sẽ "dùng hết" ảnh thật của user
+    (đánh dấu last_sent_at khiến ảnh bị coi là vừa gửi, user thật dễ bị báo
+    "hết ảnh" oan). Vẫn cùng 1 kiểu truy vấn $sample -> đo đúng chi phí đọc
+    thật sự của MongoDB, chỉ khác không có phần ghi (update) đi kèm.
+
+    Trả về document (dict) hoặc None nếu category không có ảnh nào (kể cả
+    ảnh đang trong cooldown cũng không tính, vì mục đích chỉ để đo tốc độ
+    đọc, không cần đúng logic "khả dụng" như get_next_image).
+    """
+    db = get_db()
+    collection = db[COLLECTION_NAME]
+    results = list(collection.aggregate([
+        {"$match": {"category": category}},
+        {"$sample": {"size": 1}},
+    ]))
+    return results[0] if results else None
+
+
 @_timed
 def get_random_image(exclude_urls: list = None, category_keys: list = None):
     """

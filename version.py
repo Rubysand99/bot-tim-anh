@@ -4,5 +4,5 @@ Số bản của bot — cập nhật mỗi khi thêm tính năng/sửa lỗi đ
 Chỉ cần sửa 2 biến bên dưới, không cần đụng vào bot.py.
 """
 
-__version__ = "1.6.0"
-__description__ = "crawl_job.py giờ dùng phân trang (bookmark) của Pinterest thay vì luôn lấy lại trang đầu tiên — giảm tỉ lệ ảnh trùng/skip tăng dần theo thời gian khi crawl nhiều lần cho cùng 1 category. Đã xác nhận thực tế field bookmark qua test trên Termux."
+__version__ = "1.7.0"
+__description__ = "Thêm self-test soak: bot tự đăng ảnh vào kênh log-crawl lúc khởi động, mỗi 10s tự lấy ảnh mới (đọc thẳng MongoDB qua peek_random_image, không đánh dấu đã gửi nên không cạnh tranh ảnh với user thật) để phát hiện MongoDB chậm/lỗi bất thường theo thời gian dài."

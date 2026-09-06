@@ -271,6 +271,18 @@ giờ chỉ còn được `crawl_job.py` dùng, chạy nền qua GitHub Actions.
   kèm độ trễ vào kênh log ngay lúc khởi động, rồi lặp lại mỗi 10 phút. Mỗi
   lần gửi ping mới, tin ping CŨ sẽ bị xoá trước — kênh log chỉ luôn có đúng 1
   tin ping mới nhất, không bị trôi bởi hàng loạt tin ping cũ.
+- **Self-test soak (`LOG_CHANNEL_ID`):** bot tự đăng 1 embed ảnh (giống
+  `/img`, tiêu đề có tiền tố `[self-test]`) ngay lúc khởi động, rồi mỗi 10
+  giây (`SELF_TEST_INTERVAL_SECONDS` trong `bot.py`) tự chọn ngẫu nhiên 1
+  category, đọc thẳng MongoDB (`db.peek_random_image` — **không** đánh dấu
+  `last_sent_at` nên không cạnh tranh ảnh với user thật), đo thời gian đọc
+  + thời gian sửa tin nhắn, rồi edit đè lên đúng 1 tin nhắn đó (không spam
+  tin mới). Mục đích: bot **không thể tự "bấm" nút của chính nó** (nút
+  Trước/Sau chỉ hoạt động qua interaction thật của user), nên đây là cách
+  gần nhất để tự động kiểm tra dài hạn xem MongoDB có thỉnh thoảng chậm/lỗi
+  bất thường hay không — nếu có, tự log `WARNING` (hiện ngay trong kênh này
+  nhờ `DiscordAlertHandler`) kèm thời gian cụ thể, ngưỡng cảnh báo
+  `SELF_TEST_SLOW_THRESHOLD_SECONDS = 1.0` giây.
 - **Hiệu năng lấy ảnh:** mỗi lần `/img`/`/random` lấy ảnh, bot đo thời gian
   đọc MongoDB, tự cảnh báo (và gửi vào kênh log nếu bật) nếu chậm bất
   thường (> 3s) — giúp xác định chỗ nghẽn khi bot phản hồi chậm. Category
