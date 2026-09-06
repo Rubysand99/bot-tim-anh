@@ -282,7 +282,16 @@ giờ chỉ còn được `crawl_job.py` dùng, chạy nền qua GitHub Actions.
   gần nhất để tự động kiểm tra dài hạn xem MongoDB có thỉnh thoảng chậm/lỗi
   bất thường hay không — nếu có, tự log `WARNING` (hiện ngay trong kênh này
   nhờ `DiscordAlertHandler`) kèm thời gian cụ thể, ngưỡng cảnh báo
-  `SELF_TEST_SLOW_THRESHOLD_SECONDS = 1.0` giây.
+  `SELF_TEST_SLOW_THRESHOLD_SECONDS = 1.0` giây. Nếu bốc trúng URL ảnh
+  không hợp lệ (dài hơn 2048 ký tự — Discord sẽ từ chối cả embed), tự xoá
+  luôn URL đó khỏi DB ngay lập tức, không cần đợi user thật gặp lỗi trước.
+- **Tự chữa lành URL ảnh xấu:** `crawl_job.py` chặn URL không hợp lệ ngay
+  lúc crawl (`db.is_valid_image_url` — kiểm tra độ dài ≤ 2048, đúng scheme
+  http/https, không có khoảng trắng), không cho lưu vào DB từ đầu. Với URL
+  xấu đã lỡ nằm sẵn trong DB từ trước, `_fetch_next_image_url` trong
+  `bot.py` (dùng chung cho `/img`, `/random`, Trước/Sau, showcase) tự phát
+  hiện + xoá + thử ảnh khác (tối đa 3 lần) — user thật không bao giờ thấy
+  lỗi 400 "Invalid Form Body" của Discord nữa.
 - **Hiệu năng lấy ảnh:** mỗi lần `/img`/`/random` lấy ảnh, bot đo thời gian
   đọc MongoDB, tự cảnh báo (và gửi vào kênh log nếu bật) nếu chậm bất
   thường (> 3s) — giúp xác định chỗ nghẽn khi bot phản hồi chậm. Category

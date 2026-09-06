@@ -35,6 +35,7 @@ from db import (
     set_last_crawl_time,
     get_category_bookmark,
     set_category_bookmark,
+    is_valid_image_url,
 )
 from pinterest_crawler import search_pinterest_images_with_retry
 
@@ -71,6 +72,14 @@ def get_all_categories() -> dict:
     return merged
 
 
+# Discord giới hạn URL trong embeds.image.url tối đa 2048 ký tự — từng gặp
+# thực tế 1 URL từ Pinterest vượt giới hạn này (nguyên nhân chưa rõ, có thể
+# lỗi lạ từ phía Pinterest), khiến Discord từ chối cả embed với lỗi 400
+# "Invalid Form Body" khi bot cố gửi/sửa tin nhắn chứa ảnh đó — phát hiện
+# qua self-test soak trong bot.py. Validate trước khi lưu để chặn từ gốc,
+# không bao giờ để lọt vào DB nữa (dùng chung is_valid_image_url từ db.py).
+
+
 def crawl_category(slug: str, keyword: str):
     """Trả về (số ảnh mới thêm, số ảnh đã trùng/đã có sẵn, có lỗi hay không)."""
     db = get_db()
@@ -95,7 +104,12 @@ def crawl_category(slug: str, keyword: str):
 
     inserted = 0
     skipped = 0
+    invalid = 0
     for url in image_urls:
+        if not is_valid_image_url(url):
+            invalid += 1
+            logger.warning(f"Bỏ qua URL không hợp lệ khi crawl '{slug}' (dài {len(url) if url else 0} ký tự): {str(url)[:100]}...")
+            continue
         try:
             collection.insert_one({
                 "image_url": url,
@@ -107,6 +121,9 @@ def crawl_category(slug: str, keyword: str):
             inserted += 1
         except DuplicateKeyError:
             skipped += 1
+
+    if invalid:
+        logger.warning(f"Category '{slug}': bỏ qua {invalid} URL không hợp lệ trong lần crawl này.")
 
     return inserted, skipped, False
 

@@ -318,6 +318,17 @@ async def self_test_loop():
         return
     url = doc["image_url"]
 
+    if not db.is_valid_image_url(url):
+        # Tự chữa lành: URL xấu này sẽ luôn crash bất kỳ ai bốc trúng nó
+        # (kể cả user thật qua /img) -> xoá luôn khỏi DB ngay khi self-test
+        # phát hiện ra, không cần đợi tới khi Discord từ chối embed.
+        logger.warning(
+            f"[self-test] Phát hiện + tự xoá URL ảnh không hợp lệ trong '{category_key}' "
+            f"(dài {len(url)} ký tự)."
+        )
+        await bot.loop.run_in_executor(None, db.delete_images_by_url, [url])
+        return
+
     embed = _build_image_embed(f"[self-test] {info['label']}", url)
     embed.set_footer(text=f"Nguồn: kho ảnh đã crawl sẵn · fetch {fetch_elapsed*1000:.0f}ms")
 
@@ -531,6 +542,16 @@ async def _next_crawl_eta_text() -> str:
 
 
 async def _fetch_next_image_url(category_key: str, keyword: str, exclude_urls: list):
+    """
+    Lấy 1 URL ảnh khả dụng cho category, tự chữa lành nếu bốc trúng URL
+    không hợp lệ (vd dài hơn 2048 ký tự — Discord sẽ từ chối cả embed với
+    lỗi 400 "Invalid Form Body", phát hiện qua self-test soak). Nếu gặp URL
+    xấu: xoá luôn khỏi DB (không bao giờ bị bốc trúng lại lần nữa) và thử
+    lấy ảnh khác, tối đa 3 lần thử để tránh vòng lặp vô hạn nếu DB có nhiều
+    URL xấu liên tiếp.
+    """
+    exclude_urls = list(exclude_urls)  # tránh sửa list gốc của caller
+
     def fetch_db():
         try:
             doc = db.get_next_image(category_key, exclude_urls)
@@ -539,15 +560,30 @@ async def _fetch_next_image_url(category_key: str, keyword: str, exclude_urls: l
             logger.warning(f"Lỗi đọc MongoDB khi lấy ảnh cho '{category_key}': {e}")
             return None
 
-    t0 = time.monotonic()
-    url = await bot.loop.run_in_executor(None, fetch_db)
-    db_elapsed = time.monotonic() - t0
-    if db_elapsed > SLOW_DB_THRESHOLD_SECONDS:
-        logger.warning(f"Đọc MongoDB cho '{category_key}' chậm bất thường: {db_elapsed:.1f}s")
-    else:
-        logger.info(f"[perf] Đọc MongoDB cho '{category_key}': {db_elapsed:.2f}s")
+    for attempt in range(3):
+        t0 = time.monotonic()
+        url = await bot.loop.run_in_executor(None, fetch_db)
+        db_elapsed = time.monotonic() - t0
+        if db_elapsed > SLOW_DB_THRESHOLD_SECONDS:
+            logger.warning(f"Đọc MongoDB cho '{category_key}' chậm bất thường: {db_elapsed:.1f}s")
+        else:
+            logger.info(f"[perf] Đọc MongoDB cho '{category_key}': {db_elapsed:.2f}s")
 
-    return url
+        if not url:
+            return None
+
+        if db.is_valid_image_url(url):
+            return url
+
+        logger.warning(
+            f"Bốc trúng URL ảnh không hợp lệ trong '{category_key}' (dài {len(url)} ký tự) "
+            f"-> tự xoá khỏi DB và thử ảnh khác."
+        )
+        await bot.loop.run_in_executor(None, db.delete_images_by_url, [url])
+        exclude_urls.append(url)
+
+    logger.warning(f"'{category_key}': bốc trúng URL xấu 3 lần liên tiếp, tạm dừng thử thêm.")
+    return None
 
 
 def _build_image_embed(label: str, url: str) -> discord.Embed:

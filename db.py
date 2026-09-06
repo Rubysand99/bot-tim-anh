@@ -97,6 +97,26 @@ def _mark_sent(doc_id) -> None:
     )
 
 
+# Discord giới hạn URL trong embeds.image.url tối đa 2048 ký tự — từng gặp
+# thực tế 1 URL từ Pinterest vượt giới hạn này, khiến Discord từ chối cả
+# embed với lỗi 400 "Invalid Form Body" (phát hiện qua self-test soak trong
+# bot.py). Dùng chung ở crawl_job.py (chặn từ gốc, không cho lưu vào DB) và
+# bot.py (tự chữa lành nếu lỡ có URL xấu nào đã nằm sẵn trong DB từ trước).
+MAX_IMAGE_URL_LENGTH = 2048
+
+
+def is_valid_image_url(url: str) -> bool:
+    if not url or not isinstance(url, str):
+        return False
+    if len(url) > MAX_IMAGE_URL_LENGTH:
+        return False
+    if not (url.startswith("http://") or url.startswith("https://")):
+        return False
+    if any(c.isspace() for c in url):
+        return False
+    return True
+
+
 @_timed
 def get_next_image(category: str, exclude_urls: list):
     """
