@@ -397,7 +397,13 @@ async def on_ready():
     if not heartbeat_ping.is_running():
         heartbeat_ping.start()  # tự gửi ping ngay lần đầu, sau đó lặp lại mỗi 10 phút
     if not self_test_loop.is_running():
-        self_test_loop.start()  # soak-test tự động, lặp mỗi 10 giây (xem ghi chú ở định nghĩa)
+        # ĐÃ TẮT theo yêu cầu — đã dùng self-test để chẩn đoán xong nguyên
+        # nhân "không phản hồi kịp thời" (xác nhận: MongoDB ổn định, ~3.1%
+        # lệnh gọi Discord API chậm bất thường là baseline hạ tầng bình
+        # thường, không phải bug). Bỏ comment dòng dưới nếu cần bật lại để
+        # điều tra thêm trong tương lai.
+        # self_test_loop.start()
+        pass
     logger.info("------------------------------------------")
 
 
