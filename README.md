@@ -271,20 +271,26 @@ giờ chỉ còn được `crawl_job.py` dùng, chạy nền qua GitHub Actions.
   kèm độ trễ vào kênh log ngay lúc khởi động, rồi lặp lại mỗi 10 phút. Mỗi
   lần gửi ping mới, tin ping CŨ sẽ bị xoá trước — kênh log chỉ luôn có đúng 1
   tin ping mới nhất, không bị trôi bởi hàng loạt tin ping cũ.
-- **Self-test soak (`LOG_CHANNEL_ID`):** bot tự đăng 1 embed ảnh (giống
-  `/img`, tiêu đề có tiền tố `[self-test]`) ngay lúc khởi động, rồi mỗi 10
-  giây (`SELF_TEST_INTERVAL_SECONDS` trong `bot.py`) tự chọn ngẫu nhiên 1
-  category, đọc thẳng MongoDB (`db.peek_random_image` — **không** đánh dấu
-  `last_sent_at` nên không cạnh tranh ảnh với user thật), đo thời gian đọc
-  + thời gian sửa tin nhắn, rồi edit đè lên đúng 1 tin nhắn đó (không spam
-  tin mới). Mục đích: bot **không thể tự "bấm" nút của chính nó** (nút
-  Trước/Sau chỉ hoạt động qua interaction thật của user), nên đây là cách
-  gần nhất để tự động kiểm tra dài hạn xem MongoDB có thỉnh thoảng chậm/lỗi
-  bất thường hay không — nếu có, tự log `WARNING` (hiện ngay trong kênh này
-  nhờ `DiscordAlertHandler`) kèm thời gian cụ thể, ngưỡng cảnh báo
-  `SELF_TEST_SLOW_THRESHOLD_SECONDS = 1.0` giây. Nếu bốc trúng URL ảnh
-  không hợp lệ (dài hơn 2048 ký tự — Discord sẽ từ chối cả embed), tự xoá
-  luôn URL đó khỏi DB ngay lập tức, không cần đợi user thật gặp lỗi trước.
+- **Self-test soak (`LOG_CHANNEL_ID`) — HIỆN ĐANG TẮT:** bot tự đăng 1 embed
+  ảnh (giống `/img`, tiêu đề `[self-test]`) lúc khởi động, mỗi 10 giây tự
+  đọc MongoDB (`db.peek_random_image`, không đánh dấu `last_sent_at` nên
+  không cạnh tranh ảnh với user thật) + tự sửa tin nhắn, đo timing 2 bước
+  đó. Đã dùng để chẩn đoán xong (xác nhận MongoDB ổn định, phát hiện + sửa
+  bug URL ảnh dài >2048 ký tự) nên tạm tắt (comment dòng `self_test_loop.start()`
+  trong `on_ready()`) — bật lại dễ dàng nếu cần điều tra thêm. **Lưu ý quan
+  trọng đã rút ra:** self-test loại này KHÔNG đo được tốc độ thật của
+  `interaction.response.defer()` (bot không thể tự tạo interaction để gọi
+  hàm này), chỉ đo được `message.edit()` thường — 2 API endpoint khác nhau
+  của Discord, có thể có tốc độ khác nhau. Xem mục `_timed_defer()` bên dưới
+  để đo đúng cái cần đo.
+- **`_timed_defer()` — đo timing THẬT của defer():** dùng chung cho toàn bộ
+  12 lệnh gọi `interaction.response.defer()` trong bot (mọi slash command +
+  mọi nút bấm). Log **mọi lần gọi** ở mức INFO (`[defer] OK: 340ms`), cảnh
+  báo WARNING nếu vượt `DEFER_SLOW_THRESHOLD_SECONDS = 1.0` giây
+  (`[defer] Chậm bất thường: 1.85s`), và log riêng nếu interaction hết hạn
+  trước khi kịp defer (`[defer] Interaction đã hết hạn...`). Đây là cách
+  đúng để xác nhận defer() có phải nguồn gây "không phản hồi kịp thời" hay
+  không — dựa trên dữ liệu thật từ production, không suy luận gián tiếp.
 - **Tự chữa lành URL ảnh xấu:** `crawl_job.py` chặn URL không hợp lệ ngay
   lúc crawl (`db.is_valid_image_url` — kiểm tra độ dài ≤ 2048, đúng scheme
   http/https, không có khoảng trắng), không cho lưu vào DB từ đầu. Với URL

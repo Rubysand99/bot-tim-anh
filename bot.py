@@ -515,6 +515,44 @@ async def category_autocomplete(interaction: discord.Interaction, current: str):
 
 SLOW_DB_THRESHOLD_SECONDS = 3
 CRAWL_INTERVAL_HOURS = 2  # phải khớp lịch cron trong .github/workflows/main.yml
+DEFER_SLOW_THRESHOLD_SECONDS = 1.0
+
+
+async def _timed_defer(interaction: discord.Interaction, ephemeral: bool = False) -> bool:
+    """
+    Wrapper dùng chung cho MỌI lệnh gọi interaction.response.defer() trong
+    bot — đo thời gian THẬT SỰ của chính lệnh gọi này (khác với self-test
+    soak trước đây, vốn chỉ đo tốc độ đọc MongoDB + message.edit() thường,
+    KHÔNG đo được defer() thật vì bot không thể tự tạo interaction để gọi).
+    defer() dùng API endpoint riêng (POST /interactions/.../callback), có
+    thể có đặc tính tốc độ khác hẳn message.edit() (PATCH /messages/...).
+
+    Log MỌI lần gọi (không chỉ lúc lỗi) ở mức INFO, và WARNING nếu vượt
+    DEFER_SLOW_THRESHOLD_SECONDS — để có dữ liệu thống kê thật từ production,
+    xác nhận defer() có thực sự là nguồn gây "không phản hồi kịp thời" hay
+    không, thay vì suy luận gián tiếp qua self-test.
+
+    Trả về True nếu defer() thành công, False nếu lỗi (caller nên return
+    ngay khi nhận False, vì interaction có thể đã không còn dùng được).
+    """
+    t0 = time.monotonic()
+    try:
+        await interaction.response.defer(ephemeral=ephemeral)
+    except discord.NotFound:
+        elapsed = time.monotonic() - t0
+        logger.warning(f"[defer] Interaction đã hết hạn trước khi kịp defer() (chờ {elapsed:.2f}s).")
+        return False
+    except Exception as e:
+        elapsed = time.monotonic() - t0
+        logger.warning(f"[defer] Lỗi không xác định khi defer() (sau {elapsed:.2f}s): {e}")
+        return False
+
+    elapsed = time.monotonic() - t0
+    if elapsed >= DEFER_SLOW_THRESHOLD_SECONDS:
+        logger.warning(f"[defer] Chậm bất thường: {elapsed:.2f}s")
+    else:
+        logger.info(f"[defer] OK: {elapsed*1000:.0f}ms")
+    return True
 
 
 async def _next_crawl_eta_text() -> str:
@@ -627,13 +665,7 @@ async def _paginator_navigate(interaction: discord.Interaction, direction: int, 
     # Vì đã defer() không điều kiện ngay từ đầu, mọi nhánh bên dưới đều phải dùng
     # edit_original_response() thay vì response.edit_message() (không thể gọi
     # response.edit_message() sau khi đã defer()).
-    try:
-        await interaction.response.defer()
-    except discord.NotFound:
-        logger.warning("Paginator Trước/Sau: interaction đã hết hạn trước khi kịp defer().")
-        return
-    except Exception as e:
-        logger.warning(f"Paginator Trước/Sau: lỗi không xác định khi defer(): {e}")
+    if not await _timed_defer(interaction):
         return
 
     message_id = str(interaction.message.id)
@@ -756,14 +788,9 @@ class EphemeralImagePaginator(discord.ui.View):
     @discord.ui.button(label="💾 Lưu ảnh", style=discord.ButtonStyle.success, custom_id="epaginator:save")
     async def save_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         # Cùng nguyên tắc: defer() trước, mọi DB call sau — xem ghi chú ở
-        # _paginator_navigate() phía trên.
-        try:
-            await interaction.response.defer(ephemeral=True)
-        except discord.NotFound:
-            logger.warning("Nút 'Lưu ảnh': interaction đã hết hạn trước khi kịp defer().")
-            return
-        except Exception as e:
-            logger.warning(f"Nút 'Lưu ảnh': lỗi không xác định khi defer(): {e}")
+        # _paginator_navigate() phía trên. Dùng _timed_defer() dùng chung
+        # để có timing thống nhất trên mọi lệnh gọi defer() trong bot.
+        if not await _timed_defer(interaction, ephemeral=True):
             return
 
         message_id = str(interaction.message.id)
@@ -840,21 +867,12 @@ class ShowcaseStartView(discord.ui.View):
         # trước khi code kịp defer. Defer trước rồi mới check sẽ không còn
         # giới hạn 3 giây nữa (chỉ còn giới hạn 15 phút của followup).
         #
-        # Bọc try/except quanh defer(): nếu Discord đã huỷ interaction TRƯỚC
-        # khi defer() kịp gửi đi (token hết hạn/interaction "Unknown"), lỗi
-        # này vốn dĩ discord.py chỉ log ra console chung, không thấy trong
-        # kênh log riêng — log rõ ra đây để lần sau biết chính xác là lỗi gì
-        # (mạng chậm thật sự, hay Discord-side timing) thay vì đoán mò.
-        try:
-            await interaction.response.defer(ephemeral=True)
-        except discord.NotFound:
-            logger.warning(
-                "Nút 'Bắt đầu' (showcase): interaction đã hết hạn trước khi kịp defer() — "
-                "khả năng cao do độ trễ mạng/Discord tại thời điểm bấm, không phải lỗi code."
-            )
-            return
-        except Exception as e:
-            logger.warning(f"Nút 'Bắt đầu' (showcase): lỗi không xác định khi defer(): {e}")
+        # Bọc try/except quanh defer() qua _timed_defer() dùng chung — đo
+        # timing thống nhất trên mọi lệnh gọi defer() trong bot, giúp xác
+        # nhận defer() có thực sự là nguồn gây timeout hay không (khác với
+        # self-test soak trước đây, chỉ đo được message.edit() thường, không
+        # đo được đúng API defer() thật).
+        if not await _timed_defer(interaction, ephemeral=True):
             return
 
         message_id = str(interaction.message.id)
@@ -932,7 +950,8 @@ async def img_slash(interaction: discord.Interaction, chu_de: str):
         return
     mark_used(interaction.user.id)
 
-    await interaction.response.defer()
+    if not await _timed_defer(interaction):
+        return
 
     all_cats = await get_all_categories_async()
     info = all_cats.get(chu_de)
@@ -1050,7 +1069,8 @@ async def random_slash(interaction: discord.Interaction):
         return
     mark_used(interaction.user.id)
 
-    await interaction.response.defer()
+    if not await _timed_defer(interaction):
+        return
 
     category_key, label, keyword, url = await _get_random_image_result(interaction.channel)
     if not url:
@@ -1140,7 +1160,8 @@ async def _build_stats_embed() -> discord.Embed:
 
 @bot.tree.command(name="stats", description="Xem thống kê chi tiết kho ảnh theo từng chủ đề")
 async def stats_slash(interaction: discord.Interaction):
-    await interaction.response.defer()
+    if not await _timed_defer(interaction):
+        return
     embed = await _build_stats_embed()
     await interaction.followup.send(embed=embed)
 
@@ -1209,7 +1230,8 @@ async def addcategory_slash(interaction: discord.Interaction, slug: str, label: 
         )
         return
 
-    await interaction.response.defer()
+    if not await _timed_defer(interaction):
+        return
     await bot.loop.run_in_executor(None, db.add_custom_category, slug, label, keyword, nsfw)
     _invalidate_categories_cache()
     extra = await _maybe_crawl_new_category_now(slug, keyword)
@@ -1273,7 +1295,8 @@ async def editcategory_slash(interaction: discord.Interaction, slug: str, label:
         )
         return
 
-    await interaction.response.defer(ephemeral=True)
+    if not await _timed_defer(interaction, ephemeral=True):
+        return
     ok = await bot.loop.run_in_executor(None, db.edit_custom_category, slug, label, keyword, nsfw)
     _invalidate_categories_cache()
     if ok:
@@ -1330,7 +1353,8 @@ async def removecategory_slash(interaction: discord.Interaction, slug: str):
         )
         return
 
-    await interaction.response.defer(ephemeral=True)
+    if not await _timed_defer(interaction, ephemeral=True):
+        return
     removed = await bot.loop.run_in_executor(None, db.remove_custom_category, slug)
     _invalidate_categories_cache()
     if removed:
@@ -1412,7 +1436,8 @@ async def cleanup_slash(interaction: discord.Interaction, chu_de: str):
         await interaction.response.send_message(f"❌ Chủ đề không hợp lệ: {chu_de}", ephemeral=True)
         return
 
-    await interaction.response.defer()
+    if not await _timed_defer(interaction):
+        return
     report = await bot.loop.run_in_executor(None, _cleanup_category, chu_de)
     await interaction.followup.send(f"🧹 **{all_cats[chu_de]['label']}**: {report}")
 
@@ -1479,7 +1504,8 @@ async def showcase_slash(interaction: discord.Interaction, chu_de: str, kenh: di
             ephemeral=True,
         )
         return
-    await interaction.response.defer(ephemeral=True)
+    if not await _timed_defer(interaction, ephemeral=True):
+        return
 
     message, error = await _post_showcase_board(target_channel, chu_de, info, interaction.user.id)
     if error:
@@ -1742,7 +1768,8 @@ class ChannelAssignWizard:
         chung, rồi kết thúc wizard luôn — bỏ qua việc hỏi từng chủ đề một.
         Dùng defer() vì có thể tạo nhiều kênh liên tiếp, tốn hơn 3 giây.
         """
-        await interaction.response.defer()
+        if not await _timed_defer(interaction):
+            return
 
         remaining = self.categories[self.index:]
         setup_category, cat_error = await _ensure_setup_channel_category(interaction.guild)
