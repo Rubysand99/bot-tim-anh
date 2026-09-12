@@ -26,7 +26,7 @@ from datetime import datetime, timezone
 import requests
 from pymongo.errors import DuplicateKeyError
 
-from categories import CATEGORIES
+from categories import CATEGORIES, get_keywords
 from db import (
     get_db,
     COLLECTION_NAME,
@@ -80,27 +80,22 @@ def get_all_categories() -> dict:
 # không bao giờ để lọt vào DB nữa (dùng chung is_valid_image_url từ db.py).
 
 
-def crawl_category(slug: str, keyword: str):
-    """Trả về (số ảnh mới thêm, số ảnh đã trùng/đã có sẵn, có lỗi hay không)."""
-    db = get_db()
-    collection = db[COLLECTION_NAME]
-
-    # Phân trang qua bookmark: tiếp tục đúng chỗ lần crawl TRƯỚC đã dừng lại,
-    # thay vì luôn lấy lại đúng trang đầu tiên (nguyên nhân chính khiến tỉ lệ
-    # ảnh trùng/skip tăng dần theo thời gian — đã xác nhận thực tế Pinterest
-    # có hỗ trợ bookmark qua test trên Termux, 09/2026). Khi Pinterest báo hết
-    # trang (bookmark trả về None), lần crawl sau tự quay lại trang đầu —
-    # lúc đó top kết quả thường đã đổi khác nên vẫn có ảnh mới, không lặp vô hạn.
-    bookmark = get_category_bookmark(slug)
+def _crawl_one_keyword(slug: str, keyword: str, collection):
+    """Crawl 1 (category, từ khóa) — bookmark phân trang lưu riêng theo
+    TỪNG CẶP slug+keyword (không dùng chung 1 bookmark cho cả category),
+    vì mỗi từ khóa có kết quả tìm kiếm Pinterest khác nhau, cần phân trang
+    độc lập với nhau. Trả về (inserted, skipped, had_error)."""
+    bookmark_key = f"{slug}::{keyword}"
+    bookmark = get_category_bookmark(bookmark_key)
     try:
         image_urls, next_bookmark = search_pinterest_images_with_retry(
             keyword, limit=IMAGES_PER_CATEGORY, bookmark=bookmark
         )
     except Exception as err:
-        logger.warning(f"Lỗi crawl category '{slug}': {err}")
+        logger.warning(f"Lỗi crawl category '{slug}' (từ khóa '{keyword}'): {err}")
         return 0, 0, True
 
-    set_category_bookmark(slug, next_bookmark)
+    set_category_bookmark(bookmark_key, next_bookmark)
 
     inserted = 0
     skipped = 0
@@ -123,9 +118,38 @@ def crawl_category(slug: str, keyword: str):
             skipped += 1
 
     if invalid:
-        logger.warning(f"Category '{slug}': bỏ qua {invalid} URL không hợp lệ trong lần crawl này.")
+        logger.warning(f"Category '{slug}' (từ khóa '{keyword}'): bỏ qua {invalid} URL không hợp lệ trong lần crawl này.")
 
     return inserted, skipped, False
+
+
+def crawl_category(slug: str, keywords: list):
+    """
+    Crawl LẦN LƯỢT từng từ khóa trong danh sách cho category này (1 category
+    giờ có thể gộp nhiều từ khóa — ảnh crawl từ mọi từ khóa đều lưu chung
+    dưới cùng 1 category, không phân biệt từ khóa nào tìm ra). Mỗi từ khóa
+    có bookmark phân trang Pinterest riêng (xem _crawl_one_keyword).
+
+    Trả về (tổng số ảnh mới thêm, tổng số ảnh đã trùng/đã có sẵn, có lỗi
+    hay không). had_error chỉ True nếu TẤT CẢ từ khóa đều lỗi — 1 từ khóa
+    lỗi nhưng từ khóa khác vẫn crawl được thì vẫn coi là category thành
+    công (một phần), không chặn ảnh mới từ các từ khóa còn lại.
+    """
+    db = get_db()
+    collection = db[COLLECTION_NAME]
+
+    total_inserted = 0
+    total_skipped = 0
+    error_count = 0
+    for keyword in keywords:
+        inserted, skipped, had_error = _crawl_one_keyword(slug, keyword, collection)
+        total_inserted += inserted
+        total_skipped += skipped
+        if had_error:
+            error_count += 1
+
+    had_error = error_count > 0 and error_count == len(keywords)
+    return total_inserted, total_skipped, had_error
 
 
 def main():
@@ -137,8 +161,9 @@ def main():
     failed_categories = []
 
     for slug, info in all_categories.items():
-        logger.info(f"→ Crawl category: {info['label']} (keyword: {info['keyword']})")
-        inserted, skipped, had_error = crawl_category(slug, info["keyword"])
+        keywords = get_keywords(info)
+        logger.info(f"→ Crawl category: {info['label']} (từ khóa: {', '.join(keywords)})")
+        inserted, skipped, had_error = crawl_category(slug, keywords)
         logger.info(f"  + {inserted} ảnh mới, {skipped} ảnh trùng (đã có sẵn)")
         total_inserted += inserted
         total_skipped += skipped

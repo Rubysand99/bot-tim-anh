@@ -267,10 +267,16 @@ def get_category_stats(category: str) -> dict:
 def get_custom_categories() -> dict:
     db = get_db()
     docs = db[CUSTOM_CATEGORIES_COLLECTION].find({})
-    return {
-        d["_id"]: {"label": d["label"], "keyword": d["keyword"], "nsfw": d.get("nsfw", False)}
-        for d in docs
-    }
+    result = {}
+    for d in docs:
+        # Tương thích ngược: category thêm TRƯỚC khi có tính năng nhiều từ
+        # khóa chỉ có field "keyword" (chuỗi đơn) trong Mongo, chưa có
+        # "keywords" (danh sách). Chuẩn hoá về "keywords" ngay tại đây để
+        # phần còn lại của code (bot.py, crawl_job.py) chỉ cần biết 1 format
+        # duy nhất — không cần migrate dữ liệu cũ thủ công trong Mongo.
+        keywords = d.get("keywords") or ([d["keyword"]] if d.get("keyword") else [])
+        result[d["_id"]] = {"label": d["label"], "keywords": keywords, "nsfw": d.get("nsfw", False)}
+    return result
 
 
 @_timed
@@ -280,31 +286,36 @@ def custom_category_exists(slug: str) -> bool:
 
 
 @_timed
-def add_custom_category(slug: str, label: str, keyword: str, nsfw: bool = False) -> None:
+def add_custom_category(slug: str, label: str, keywords: list, nsfw: bool = False) -> None:
     db = get_db()
     db[CUSTOM_CATEGORIES_COLLECTION].update_one(
         {"_id": slug},
-        {"$set": {"label": label, "keyword": keyword, "nsfw": nsfw}},
+        {"$set": {"label": label, "keywords": list(keywords), "nsfw": nsfw}, "$unset": {"keyword": ""}},
         upsert=True,
     )
 
 
 @_timed
-def edit_custom_category(slug: str, label: str = None, keyword: str = None, nsfw: bool = None) -> bool:
-    """Sửa label/keyword/nsfw của 1 category CUSTOM đã tồn tại. Trả về False nếu chưa từng thêm qua lệnh."""
+def edit_custom_category(slug: str, label: str = None, keywords: list = None, nsfw: bool = None) -> bool:
+    """Sửa label/keywords/nsfw của 1 category CUSTOM đã tồn tại. Trả về False nếu chưa từng thêm qua lệnh."""
     db = get_db()
     if not custom_category_exists(slug):
         return False
     update = {}
     if label:
         update["label"] = label
-    if keyword:
-        update["keyword"] = keyword
+    if keywords:
+        update["keywords"] = list(keywords)
     if nsfw is not None:
         update["nsfw"] = nsfw
     if not update:
         return True
-    db[CUSTOM_CATEGORIES_COLLECTION].update_one({"_id": slug}, {"$set": update})
+    # $unset "keyword" (field cũ, chuỗi đơn) mỗi lần sửa keywords, để dữ liệu
+    # dần chuyển hẳn sang format mới thay vì để field cũ nằm thừa mãi.
+    op = {"$set": update}
+    if keywords:
+        op["$unset"] = {"keyword": ""}
+    db[CUSTOM_CATEGORIES_COLLECTION].update_one({"_id": slug}, op)
     return True
 
 
@@ -395,12 +406,41 @@ def get_paginator_session(message_id: str):
 
 
 @_timed
-def update_paginator_session(message_id: str, images: list, index: int) -> None:
+def update_paginator_index(message_id: str, index: int) -> None:
+    """Chỉ cập nhật vị trí đang xem (đi Trước, hoặc đi Sau vào ảnh đã có sẵn
+    trong bộ đệm) — KHÔNG đụng tới mảng images, để không bao giờ đè mất ảnh
+    mà tác vụ tải trước (prefetch) nền vừa $push thêm vào cùng lúc."""
     db = get_db()
     db[PAGINATOR_SESSIONS_COLLECTION].update_one(
         {"_id": message_id},
-        {"$set": {"images": images, "index": index, "updated_at": now_utc()}},
+        {"$set": {"index": index, "updated_at": now_utc()}},
     )
+
+
+@_timed
+def append_image_and_set_index(message_id: str, url: str, index: int) -> None:
+    """Thêm 1 ảnh MỚI vào cuối mảng images + di chuyển tới đúng ảnh đó, dùng
+    $push (nguyên tử) thay vì ghi đè cả mảng — an toàn nếu có tác vụ prefetch
+    nền khác cũng đang $push vào cùng session ngay lúc này."""
+    db = get_db()
+    db[PAGINATOR_SESSIONS_COLLECTION].update_one(
+        {"_id": message_id},
+        {"$push": {"images": url}, "$set": {"index": index, "updated_at": now_utc()}},
+    )
+
+
+@_timed
+def append_image_to_session(message_id: str, url: str) -> bool:
+    """Tải trước (prefetch): thêm 1 ảnh vào cuối mảng images mà KHÔNG đổi
+    index đang xem (ảnh này chỉ để sẵn đó, chờ user thật sự bấm Sau tới nó).
+    Trả về False nếu session không còn tồn tại nữa (tin nhắn đã quá cũ/bị
+    dọn) — khi đó bên gọi chỉ cần bỏ qua, không phải lỗi cần xử lý gì thêm."""
+    db = get_db()
+    result = db[PAGINATOR_SESSIONS_COLLECTION].update_one(
+        {"_id": message_id},
+        {"$push": {"images": url}, "$set": {"updated_at": now_utc()}},
+    )
+    return result.matched_count > 0
 
 
 # ============================================================

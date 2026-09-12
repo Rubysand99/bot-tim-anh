@@ -12,7 +12,7 @@ import requests
 from discord import app_commands
 from discord.ext import commands, tasks
 from keep_alive import keep_alive
-from categories import CATEGORIES
+from categories import CATEGORIES, keywords_display
 import db
 import crawl_job
 from version import __version__, __description__
@@ -638,7 +638,7 @@ async def _next_crawl_eta_text() -> str:
     return f"khoảng {hours} tiếng {mins} phút nữa"
 
 
-async def _fetch_next_image_url(category_key: str, keyword: str, exclude_urls: list):
+async def _fetch_next_image_url(category_key: str, exclude_urls: list):
     """
     Lấy 1 URL ảnh khả dụng cho category, tự chữa lành nếu bốc trúng URL
     không hợp lệ (vd dài hơn 2048 ký tự — Discord sẽ từ chối cả embed với
@@ -690,21 +690,57 @@ def _build_image_embed(label: str, url: str) -> discord.Embed:
     return embed
 
 
-async def _send_image_result(send_func, category_key: str, label: str, keyword: str, url: str, author_id: int, view=None):
+def _schedule_prefetch(message_id: str, category_key: str, exclude_urls: list) -> None:
+    """
+    Tải trước (prefetch) 1 ảnh kế tiếp trong nền, KHÔNG chặn phản hồi hiện
+    tại — mục đích để lần bấm "Sau" TIẾP THEO có ảnh sẵn trong bộ đệm, khỏi
+    phải chờ Mongo lúc đang bấm (đây là nguồn gây độ trễ nhận thấy được khi
+    chuyển ảnh mà trước đây phải fetch đồng bộ ngay lúc bấm).
+
+    Chạy qua bot.loop.create_task() (fire-and-forget) + tự bắt mọi exception
+    bên trong, để lỗi tải trước (nếu có) không bao giờ ảnh hưởng tới phản hồi
+    chính đang gửi cho user, và không bị asyncio cảnh báo "Task exception was
+    never retrieved".
+    """
+    async def _do_prefetch():
+        try:
+            new_url = await _fetch_next_image_url(category_key, exclude_urls)
+            if new_url:
+                await bot.loop.run_in_executor(None, db.append_image_to_session, message_id, new_url)
+        except Exception as e:
+            logger.warning(f"[prefetch] Lỗi tải trước ảnh cho session {message_id}: {e}")
+
+    bot.loop.create_task(_do_prefetch())
+
+
+def _maybe_schedule_prefetch(message_id: str, category_key: str, images: list, index: int) -> None:
+    """Chỉ tải trước khi đang đứng ở ẢNH CUỐI của bộ đệm hiện tại — nghĩa là
+    lần bấm "Sau" kế tiếp chắc chắn sẽ cần 1 ảnh chưa từng có sẵn."""
+    if index >= len(images) - 1:
+        _schedule_prefetch(message_id, category_key, list(images))
+
+
+async def _send_image_result(send_func, category_key: str, label: str, keywords_text: str, url: str, author_id: int, view=None):
     """
     send_func: async callable(embed, view) -> discord.Message
     Gửi ảnh + lưu phiên xem (paginator session) vào MongoDB theo message.id,
     để nút Trước/Sau hoạt động vĩnh viễn (không phụ thuộc RAM của bot).
     view: mặc định PAGINATOR_VIEW (2 nút công khai); truyền EPHEMERAL_PAGINATOR_VIEW
     (3 nút, có Lưu ảnh) khi gửi qua showcase board.
+    keywords_text: chuỗi hiển thị các từ khóa của category (chỉ để lưu vào
+    session cho mục đích tra cứu/hiển thị — KHÔNG dùng để truy vấn ảnh).
     """
     if view is None:
         view = PAGINATOR_VIEW
     embed = _build_image_embed(label, url)
     message = await send_func(embed=embed, view=view)
+    message_id = str(message.id)
     await bot.loop.run_in_executor(
-        None, db.save_paginator_session, str(message.id), category_key, label, keyword, [url], 0, author_id
+        None, db.save_paginator_session, message_id, category_key, label, keywords_text, [url], 0, author_id
     )
+    # Tải trước ngay ảnh thứ 2 — session vừa tạo chỉ có đúng 1 ảnh (index 0,
+    # cũng là ảnh cuối bộ đệm) nên chắc chắn cần tải trước.
+    _maybe_schedule_prefetch(message_id, category_key, [url], 0)
 
 
 async def _paginator_navigate(interaction: discord.Interaction, direction: int, view: discord.ui.View):
@@ -738,23 +774,30 @@ async def _paginator_navigate(interaction: discord.Interaction, direction: int, 
 
     images = session["images"]
     index = session["index"]
+    category_key = session["category_key"]
 
     if direction < 0:
         index = max(0, index - 1)
-        await bot.loop.run_in_executor(None, db.update_paginator_session, message_id, images, index)
         await interaction.edit_original_response(embed=_build_image_embed(session["label"], images[index]), view=view)
+        await bot.loop.run_in_executor(None, db.update_paginator_index, message_id, index)
         return
 
-    # direction > 0 ("Sau"): còn ảnh đệm sẵn -> chuyển luôn
+    # direction > 0 ("Sau"): còn ảnh đệm sẵn (nhờ prefetch chạy trước đó) -> chuyển luôn, không cần chờ Mongo
     if index < len(images) - 1:
         index += 1
-        await bot.loop.run_in_executor(None, db.update_paginator_session, message_id, images, index)
+        # Trả ảnh cho Discord TRƯỚC, ghi index vào Mongo SAU — user thấy ảnh
+        # ngay lập tức, không phải chờ thêm round-trip Mongo mới thấy ảnh đổi
+        # (lệch index tạm thời nếu ghi Mongo lỗi chỉ khiến 1 lần bấm kế tiếp
+        # hiện lại đúng ảnh này, không mất dữ liệu, tự sửa ở lần bấm sau).
         await interaction.edit_original_response(embed=_build_image_embed(session["label"], images[index]), view=view)
+        await bot.loop.run_in_executor(None, db.update_paginator_index, message_id, index)
+        _maybe_schedule_prefetch(message_id, category_key, images, index)
         return
 
-    # Hết ảnh đệm -> lấy ảnh mới (DB hoặc fallback Pinterest), có thể mất vài giây
-    # (đã defer() từ đầu hàm nên không còn bị giới hạn 3 giây ở đây nữa)
-    new_url = await _fetch_next_image_url(session["category_key"], session["keyword"], images)
+    # Hết ảnh đệm (prefetch chưa kịp xong, hoặc lần đầu chưa từng chạy) ->
+    # lấy ảnh mới đồng bộ ngay tại đây, có thể mất vài giây (đã defer() từ
+    # đầu hàm nên không còn bị giới hạn 3 giây ở đây nữa)
+    new_url = await _fetch_next_image_url(category_key, images)
     if not new_url:
         eta = await _next_crawl_eta_text()
         await interaction.followup.send(
@@ -764,10 +807,10 @@ async def _paginator_navigate(interaction: discord.Interaction, direction: int, 
         )
         return
 
-    images.append(new_url)
     index += 1
-    await bot.loop.run_in_executor(None, db.update_paginator_session, message_id, images, index)
-    await interaction.edit_original_response(embed=_build_image_embed(session["label"], images[index]), view=view)
+    await interaction.edit_original_response(embed=_build_image_embed(session["label"], new_url), view=view)
+    await bot.loop.run_in_executor(None, db.append_image_and_set_index, message_id, new_url, index)
+    _maybe_schedule_prefetch(message_id, category_key, images + [new_url], index)
 
 
 class PersistentImagePaginator(discord.ui.View):
@@ -980,7 +1023,7 @@ async def _do_showcase_start(interaction: discord.Interaction):
         return
     mark_used(interaction.user.id)
 
-    url = await _fetch_next_image_url(category_key, info["keyword"], [])
+    url = await _fetch_next_image_url(category_key, [])
     if not url:
         eta = await _next_crawl_eta_text()
         await interaction.followup.send(
@@ -994,7 +1037,7 @@ async def _do_showcase_start(interaction: discord.Interaction):
         return await interaction.followup.send(embed=embed, view=view, ephemeral=True, wait=True)
 
     await _send_image_result(
-        send_func, category_key, info["label"], info["keyword"], url, interaction.user.id,
+        send_func, category_key, info["label"], keywords_display(info), url, interaction.user.id,
         view=EPHEMERAL_PAGINATOR_VIEW,
     )
 
@@ -1039,7 +1082,7 @@ async def img_slash(interaction: discord.Interaction, chu_de: str):
         )
         return
 
-    url = await _fetch_next_image_url(chu_de, info["keyword"], [])
+    url = await _fetch_next_image_url(chu_de, [])
     if not url:
         eta = await _next_crawl_eta_text()
         await interaction.followup.send(
@@ -1051,7 +1094,7 @@ async def img_slash(interaction: discord.Interaction, chu_de: str):
     async def send_func(embed, view):
         return await interaction.followup.send(embed=embed, view=view, wait=True)
 
-    await _send_image_result(send_func, chu_de, info["label"], info["keyword"], url, interaction.user.id)
+    await _send_image_result(send_func, chu_de, info["label"], keywords_display(info), url, interaction.user.id)
 
 
 @bot.command(name="img", help="Lấy ảnh theo chủ đề. Vd: !img meo")
@@ -1081,7 +1124,7 @@ async def img_prefix(ctx, chu_de: str = None):
         return
     await ctx.typing()
 
-    url = await _fetch_next_image_url(category_key, info["keyword"], [])
+    url = await _fetch_next_image_url(category_key, [])
     if not url:
         eta = await _next_crawl_eta_text()
         await ctx.send(
@@ -1093,7 +1136,7 @@ async def img_prefix(ctx, chu_de: str = None):
     async def send_func(embed, view):
         return await ctx.send(embed=embed, view=view)
 
-    await _send_image_result(send_func, category_key, info["label"], info["keyword"], url, ctx.author.id)
+    await _send_image_result(send_func, category_key, info["label"], keywords_display(info), url, ctx.author.id)
 
 
 # ============================================================
@@ -1102,7 +1145,7 @@ async def img_prefix(ctx, chu_de: str = None):
 # ============================================================
 
 async def _get_random_image_result(channel):
-    """Trả về (category_key, label, keyword, url) hoặc (None, None, None, None) nếu hết ảnh."""
+    """Trả về (category_key, label, keywords_text, url) hoặc (None, None, None, None) nếu hết ảnh."""
     all_cats = await get_all_categories_async()
     channel_nsfw_ok = _channel_allows_nsfw(channel)
 
@@ -1117,18 +1160,18 @@ async def _get_random_image_result(channel):
 
     if doc:
         category_key = doc["category"]
-        info = all_cats.get(category_key, {"label": category_key, "keyword": category_key})
-        return category_key, info["label"], info["keyword"], doc["image_url"]
+        info = all_cats.get(category_key, {"label": category_key, "keywords": [category_key]})
+        return category_key, info["label"], keywords_display(info), doc["image_url"]
 
     # DB trống hoàn toàn ảnh khả dụng (trong phạm vi allowed_keys) -> thử
     # random 1 chủ đề khác (vẫn trong allowed_keys) qua _fetch_next_image_url
     # (chỉ đọc DB, không cào Pinterest trực tiếp nữa — xem ghi chú đầu file).
     category_key = random.choice(allowed_keys)
     info = all_cats[category_key]
-    url = await _fetch_next_image_url(category_key, info["keyword"], [])
+    url = await _fetch_next_image_url(category_key, [])
     if not url:
         return None, None, None, None
-    return category_key, info["label"], info["keyword"], url
+    return category_key, info["label"], keywords_display(info), url
 
 
 @bot.tree.command(name="random", description="Lấy 1 ảnh ngẫu nhiên bất kỳ trong toàn bộ kho")
@@ -1217,7 +1260,9 @@ async def _build_stats_embed() -> discord.Embed:
             continue
         total_all += s["total"]
         available_all += s["available"]
+        nsfw_tag = " 🔞" if info.get("nsfw") else ""
         value = (
+            f"Từ khóa: `{keywords_display(info)}`{nsfw_tag}\n"
             f"Tổng: **{s['total']}** · Khả dụng: **{s['available']}**\n"
             f"TB gửi: {s['avg_sent_count']} lần/ảnh (cao nhất {s['max_sent_count']})\n"
             f"Ảnh mới nhất: {_relative_time_vi(s['newest_created_at'])}"
@@ -1255,11 +1300,17 @@ async def stats_prefix(ctx):
 # (custom_categories), có hiệu lực ngay lập tức.
 # ============================================================
 
-async def _maybe_crawl_new_category_now(slug: str, keyword: str) -> str:
+def _parse_keywords_input(raw: str) -> list:
+    """Cho phép nhập nhiều từ khóa cách nhau bằng dấu phẩy, vd: 'cá heo, cá mập'."""
+    return [k.strip() for k in raw.split(",") if k.strip()]
+
+
+async def _maybe_crawl_new_category_now(slug: str, keywords: list) -> str:
     """
     Nếu lần crawl định kỳ gần nhất đã >= 1 tiếng trước (hoặc chưa từng crawl),
     crawl ngay category mới thêm để không phải chờ tới chu kỳ crawl tiếp theo.
     Trả về 1 câu mô tả kết quả để nối vào tin nhắn phản hồi.
+    keywords: danh sách từ khóa (crawl_category tự lặp qua từng từ khóa).
     """
     last_crawl = await bot.loop.run_in_executor(None, db.get_last_crawl_time)
     now = datetime.now(timezone.utc)
@@ -1269,7 +1320,7 @@ async def _maybe_crawl_new_category_now(slug: str, keyword: str) -> str:
         return " Chủ đề sẽ được crawl ở lần chạy định kỳ tiếp theo (crawl gần đây vừa mới chạy xong)."
 
     def do_crawl():
-        return crawl_job.crawl_category(slug, keyword)
+        return crawl_job.crawl_category(slug, keywords)
 
     try:
         inserted, skipped, had_error = await bot.loop.run_in_executor(None, do_crawl)
@@ -1286,10 +1337,10 @@ async def _maybe_crawl_new_category_now(slug: str, keyword: str) -> str:
 @app_commands.describe(
     slug="Mã chủ đề, không dấu/không khoảng trắng (vd: hoahong)",
     label="Tên hiển thị trong Discord",
-    keyword="Từ khóa tìm kiếm trên Pinterest",
+    keywords="Từ khóa tìm kiếm trên Pinterest — nhiều từ khóa cách nhau bằng dấu phẩy (vd: cá heo, cá mập)",
     nsfw="Chủ đề nhạy cảm, chỉ dùng được ở kênh Age-Restricted? (mặc định: Không)",
 )
-async def addcategory_slash(interaction: discord.Interaction, slug: str, label: str, keyword: str, nsfw: bool = False):
+async def addcategory_slash(interaction: discord.Interaction, slug: str, label: str, keywords: str, nsfw: bool = False):
     if not is_admin(interaction.user.id):
         await interaction.response.send_message("⚠️ Chỉ admin mới dùng được lệnh này.", ephemeral=True)
         return
@@ -1304,30 +1355,35 @@ async def addcategory_slash(interaction: discord.Interaction, slug: str, label: 
             ephemeral=True,
         )
         return
+    keywords_list = _parse_keywords_input(keywords)
+    if not keywords_list:
+        await interaction.response.send_message("⚠️ Cần ít nhất 1 từ khóa.", ephemeral=True)
+        return
 
     if not await _timed_defer(interaction):
         return
-    await bot.loop.run_in_executor(None, db.add_custom_category, slug, label, keyword, nsfw)
+    await bot.loop.run_in_executor(None, db.add_custom_category, slug, label, keywords_list, nsfw)
     _invalidate_categories_cache()
-    extra = await _maybe_crawl_new_category_now(slug, keyword)
+    extra = await _maybe_crawl_new_category_now(slug, keywords_list)
     nsfw_note = " 🔞 (đánh dấu NSFW)" if nsfw else ""
+    kw_text = ", ".join(keywords_list)
     await interaction.followup.send(
-        f"✅ Đã thêm chủ đề **{label}** (`{slug}`, từ khóa: `{keyword}`){nsfw_note}." + extra +
+        f"✅ Đã thêm chủ đề **{label}** (`{slug}`, từ khóa: `{kw_text}`){nsfw_note}." + extra +
         f"\nDùng ngay được với `/img` (gõ để autocomplete) hoặc `!img {slug}`."
     )
 
 
-@bot.command(name="addcategory", help="[Admin] !addcategory slug | Label hiển thị | từ khóa Pinterest [| nsfw]")
+@bot.command(name="addcategory", help="[Admin] !addcategory slug | Label hiển thị | từ khóa Pinterest (cách nhau bằng dấu phẩy nếu nhiều) [| nsfw]")
 async def addcategory_prefix(ctx, *, args: str = None):
     if not is_admin(ctx.author.id):
         await ctx.send("⚠️ Chỉ admin mới dùng được lệnh này.")
         return
     if not args or args.count("|") not in (2, 3):
-        await ctx.send("⚠️ Cú pháp: `!addcategory slug | Label hiển thị | từ khóa Pinterest [| nsfw]`")
+        await ctx.send("⚠️ Cú pháp: `!addcategory slug | Label hiển thị | từ khóa Pinterest (vd: cá heo, cá mập) [| nsfw]`")
         return
 
     parts = [p.strip() for p in args.split("|")]
-    slug, label, keyword = parts[0], parts[1], parts[2]
+    slug, label, keywords_raw = parts[0], parts[1], parts[2]
     nsfw = len(parts) == 4 and parts[3].lower() in ("nsfw", "true", "1", "có")
     slug = slug.lower()
     if not slug or " " in slug:
@@ -1336,24 +1392,29 @@ async def addcategory_prefix(ctx, *, args: str = None):
     if slug in CATEGORIES:
         await ctx.send(f"⚠️ `{slug}` là chủ đề có sẵn trong code, không thể ghi đè qua lệnh.")
         return
+    keywords_list = _parse_keywords_input(keywords_raw)
+    if not keywords_list:
+        await ctx.send("⚠️ Cần ít nhất 1 từ khóa.")
+        return
 
     await ctx.typing()
-    await bot.loop.run_in_executor(None, db.add_custom_category, slug, label, keyword, nsfw)
+    await bot.loop.run_in_executor(None, db.add_custom_category, slug, label, keywords_list, nsfw)
     _invalidate_categories_cache()
-    extra = await _maybe_crawl_new_category_now(slug, keyword)
+    extra = await _maybe_crawl_new_category_now(slug, keywords_list)
     nsfw_note = " 🔞 (đánh dấu NSFW)" if nsfw else ""
-    await ctx.send(f"✅ Đã thêm chủ đề **{label}** (`{slug}`, từ khóa: `{keyword}`){nsfw_note}." + extra)
+    kw_text = ", ".join(keywords_list)
+    await ctx.send(f"✅ Đã thêm chủ đề **{label}** (`{slug}`, từ khóa: `{kw_text}`){nsfw_note}." + extra)
 
 
-@bot.tree.command(name="editcategory", description="[Admin] Sửa label/keyword/nsfw của 1 chủ đề đã thêm qua lệnh")
+@bot.tree.command(name="editcategory", description="[Admin] Sửa label/keywords/nsfw của 1 chủ đề đã thêm qua lệnh")
 @app_commands.describe(
     slug="Mã chủ đề cần sửa",
     label="Tên hiển thị mới (bỏ trống nếu giữ nguyên)",
-    keyword="Từ khóa Pinterest mới (bỏ trống nếu giữ nguyên)",
+    keywords="Từ khóa Pinterest mới — nhiều từ khóa cách nhau bằng dấu phẩy, THAY THẾ toàn bộ danh sách cũ (bỏ trống nếu giữ nguyên)",
     nsfw="Đánh dấu NSFW? (bỏ trống nếu giữ nguyên)",
 )
 async def editcategory_slash(interaction: discord.Interaction, slug: str, label: str = None,
-                              keyword: str = None, nsfw: bool = None):
+                              keywords: str = None, nsfw: bool = None):
     if not is_admin(interaction.user.id):
         await interaction.response.send_message("⚠️ Chỉ admin mới dùng được lệnh này.", ephemeral=True)
         return
@@ -1364,15 +1425,16 @@ async def editcategory_slash(interaction: discord.Interaction, slug: str, label:
             f"⚠️ `{slug}` là chủ đề có sẵn trong code, không sửa được qua lệnh.", ephemeral=True
         )
         return
-    if not label and not keyword and nsfw is None:
+    keywords_list = _parse_keywords_input(keywords) if keywords else None
+    if not label and not keywords_list and nsfw is None:
         await interaction.response.send_message(
-            "⚠️ Cần cung cấp ít nhất 1 trong 3: label, keyword hoặc nsfw để sửa.", ephemeral=True
+            "⚠️ Cần cung cấp ít nhất 1 trong 3: label, keywords hoặc nsfw để sửa.", ephemeral=True
         )
         return
 
     if not await _timed_defer(interaction, ephemeral=True):
         return
-    ok = await bot.loop.run_in_executor(None, db.edit_custom_category, slug, label, keyword, nsfw)
+    ok = await bot.loop.run_in_executor(None, db.edit_custom_category, slug, label, keywords_list, nsfw)
     _invalidate_categories_cache()
     if ok:
         await interaction.followup.send(f"✅ Đã cập nhật chủ đề `{slug}`.")
@@ -1380,7 +1442,7 @@ async def editcategory_slash(interaction: discord.Interaction, slug: str, label:
         await interaction.followup.send(f"❌ Không tìm thấy chủ đề `{slug}` (chưa từng thêm qua `/addcategory`).")
 
 
-@bot.command(name="editcategory", help="[Admin] !editcategory slug | Label mới | keyword mới | nsfw mới (để trống phần nào nếu giữ nguyên)")
+@bot.command(name="editcategory", help="[Admin] !editcategory slug | Label mới | keyword mới (cách nhau bằng dấu phẩy nếu nhiều, THAY THẾ toàn bộ danh sách cũ) | nsfw mới (để trống phần nào nếu giữ nguyên)")
 async def editcategory_prefix(ctx, *, args: str = None):
     if not is_admin(ctx.author.id):
         await ctx.send("⚠️ Chỉ admin mới dùng được lệnh này.")
@@ -1390,7 +1452,7 @@ async def editcategory_prefix(ctx, *, args: str = None):
         return
 
     parts = [p.strip() for p in args.split("|")]
-    slug, label, keyword = parts[0], parts[1], parts[2]
+    slug, label, keywords_raw = parts[0], parts[1], parts[2]
     nsfw_raw = parts[3] if len(parts) == 4 else ""
     nsfw = None
     if nsfw_raw:
@@ -1400,12 +1462,13 @@ async def editcategory_prefix(ctx, *, args: str = None):
     if slug in CATEGORIES:
         await ctx.send(f"⚠️ `{slug}` là chủ đề có sẵn trong code, không sửa được qua lệnh.")
         return
-    if not label and not keyword and nsfw is None:
+    keywords_list = _parse_keywords_input(keywords_raw) if keywords_raw else None
+    if not label and not keywords_list and nsfw is None:
         await ctx.send("⚠️ Cần cung cấp ít nhất 1 trong 3: label, keyword hoặc nsfw để sửa.")
         return
 
     await ctx.typing()
-    ok = await bot.loop.run_in_executor(None, db.edit_custom_category, slug, label or None, keyword or None, nsfw)
+    ok = await bot.loop.run_in_executor(None, db.edit_custom_category, slug, label or None, keywords_list, nsfw)
     _invalidate_categories_cache()
     if ok:
         await ctx.send(f"✅ Đã cập nhật chủ đề `{slug}`.")
@@ -1542,7 +1605,7 @@ async def cleanup_prefix(ctx, chu_de: str = None):
 
 async def _post_showcase_board(target_channel, category_key: str, info: dict, admin_id: int):
     """Trả về (message, error_text). error_text != None nếu thất bại."""
-    preview_url = await _fetch_next_image_url(category_key, info["keyword"], [])
+    preview_url = await _fetch_next_image_url(category_key, [])
     if not preview_url:
         eta = await _next_crawl_eta_text()
         return None, f"❌ Không lấy được ảnh mẫu cho chủ đề: **{info['label']}** (kho đang trống, lần crawl kế tiếp {eta})."
