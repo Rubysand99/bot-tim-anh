@@ -930,9 +930,11 @@ SHOWCASE_VIEW = ShowcaseStartView()
 
 
 # ============================================================
-# Lệnh /img và !img — lấy ảnh theo chủ đề từ MongoDB (random trong
-# category, không theo thứ tự), fallback cào Pinterest trực tiếp nếu
-# DB hết ảnh khả dụng.
+# Lệnh /img và !img — lấy ảnh theo chủ đề, CHỈ đọc từ MongoDB (kho ảnh đã
+# crawl sẵn qua crawl_job.py, random trong category, không theo thứ tự).
+# Không còn fallback cào Pinterest trực tiếp lúc user đang chờ phản hồi —
+# đã bỏ hẳn cơ chế này (xem ghi chú chi tiết ở đầu khu vực "Lấy ảnh" phía
+# trên và trong crawl_job.py).
 # ============================================================
 
 @bot.tree.command(name="img", description="Lấy ảnh theo chủ đề (đã crawl sẵn từ Pinterest)")

@@ -36,7 +36,7 @@ def health():
 
 
 def run():
-    # Render tự động cấp cổng thông qua biến môi trường PORT
+    # Railway (trước đây là Render) tự động cấp cổng thông qua biến môi trường PORT
     import os
     port = int(os.environ.get("PORT", 8080))
     app.run(host='0.0.0.0', port=port)

@@ -144,13 +144,6 @@ def get_next_image(category: str, exclude_urls: list):
     return doc
 
 
-    doc = results[0]
-    _mark_sent(doc["_id"])
-    doc["last_sent_at"] = now_utc()
-    doc["sent_count"] = doc.get("sent_count", 0) + 1
-    return doc
-
-
 @_timed
 def peek_random_image(category: str):
     """
