@@ -358,32 +358,56 @@ async def _before_self_test_loop():
     await bot.wait_until_ready()
 
 
+# custom_id -> hàm xử lý thật (đã tách khỏi callback trong từng View — xem
+# _do_epaginator_save, _do_showcase_start, và _paginator_navigate).
+_COMPONENT_DISPATCH_TABLE = {
+    "paginator:prev": lambda i: _paginator_navigate(i, -1, PAGINATOR_VIEW),
+    "paginator:next": lambda i: _paginator_navigate(i, +1, PAGINATOR_VIEW),
+    "epaginator:prev": lambda i: _paginator_navigate(i, -1, EPHEMERAL_PAGINATOR_VIEW),
+    "epaginator:next": lambda i: _paginator_navigate(i, +1, EPHEMERAL_PAGINATOR_VIEW),
+    "epaginator:save": lambda i: _do_epaginator_save(i),
+    "showcase:start": lambda i: _do_showcase_start(i),
+}
+
+
 @bot.event
 async def on_interaction(interaction: discord.Interaction):
     """
-    CHẨN ĐOÁN TẠM THỜI — logger "nghe lén" thô, độc lập hoàn toàn với
-    add_view()/ViewStore của discord.py. Sự kiện 'interaction' được
-    ConnectionState.dispatch() gọi SONG SONG với, KHÔNG thay thế, cơ chế
-    khớp view nội bộ — nên thêm handler này an toàn 100%, không ảnh hưởng
-    nút bấm/slash command đang chạy.
-    Mục đích: nếu bấm nút mà dòng log [RAW interaction] bên dưới VẪN không
-    xuất hiện -> chứng minh sự kiện chưa từng tới tiến trình này (lỗi nằm
-    ở tầng Discord/gateway, ngoài tầm code). Nếu dòng này XUẤT HIỆN nhưng
-    callback nút (_timed_defer...) vẫn không chạy -> chứng minh sự kiện có
-    tới nơi, nhưng discord.py không khớp được vào persistent view nào ->
-    bug nằm ở add_view()/ViewStore, cần hướng xử lý khác hẳn (vd: bỏ cơ chế
-    persistent, tự dispatch thủ công ngay trong handler này).
-    Xoá khối này sau khi đã xác định xong nguyên nhân.
+    Dispatch thủ công cho MỌI nút bấm (component interaction), bỏ qua hẳn
+    cơ chế add_view()/ViewStore nội bộ của discord.py.
+
+    LÝ DO: đã xác nhận qua log thực tế (log [RAW interaction] thêm tạm để
+    chẩn đoán) rằng Discord luôn gửi đúng interaction tới tiến trình này —
+    kể cả khi đã tạo project Railway mới (gateway mới hoàn toàn) và reset
+    token (loại bỏ khả năng có tiến trình khác dùng chung token). Vậy
+    interaction ĐẾN đúng nơi, nhưng cơ chế add_view()/ViewStore của
+    discord.py 2.7.1 không khớp được item -> tự huỷ âm thầm, không log gì
+    (xem discord/ui/view.py, ViewStore.dispatch_view(): "If 3 lookups
+    failed at this point then just discard it"). Chưa xác định được lý do
+    sâu xa vì sao khớp thất bại (nghi vấn liên quan _get_snapshot_diff() bị
+    gọi lại nhiều lần do store_view() tự động chạy mỗi lần gửi/sửa tin
+    nhắn có view), nhưng vì on_interaction() ở đây LUÔN nhận được sự kiện
+    đúng, nên né hẳn ViewStore và tự gọi thẳng hàm xử lý là chắc ăn nhất.
+
+    An toàn với @discord.ui.button cũ: sự kiện 'interaction' do
+    ConnectionState.dispatch() bắn ra SONG SONG, không thay thế, cơ chế
+    ViewStore — nên nếu 1 ngày nào đó bản vá discord.py mới làm ViewStore
+    hoạt động lại, callback trong View (giờ chỉ còn gọi qua cùng 1 hàm dùng
+    chung) có thể chạy thêm 1 lần nữa. _timed_defer() đã tự bắt lỗi
+    "interaction đã được phản hồi" trong trường hợp đó (chỉ log warning,
+    không crash) nên không nguy hiểm, nhưng để né hẳn, kiểm tra
+    is_done() trước khi tự dispatch.
     """
+    if interaction.type != discord.InteractionType.component or interaction.response.is_done():
+        return
+    custom_id = interaction.data.get("custom_id") if interaction.data else None
+    handler = _COMPONENT_DISPATCH_TABLE.get(custom_id)
+    if handler is None:
+        return
     try:
-        custom_id = interaction.data.get("custom_id") if interaction.data else None
-        msg_id = getattr(interaction.message, "id", None) if interaction.message else None
-        logger.info(
-            f"[RAW interaction] type={interaction.type!r} custom_id={custom_id!r} "
-            f"message_id={msg_id} user={interaction.user.id} responded={interaction.response.is_done()}"
-        )
+        await handler(interaction)
     except Exception as e:
-        logger.warning(f"[RAW interaction] Lỗi khi log interaction thô: {e}")
+        logger.warning(f"[manual dispatch] Lỗi khi xử lý nút '{custom_id}': {e}")
 
 
 @bot.event
@@ -816,60 +840,70 @@ class EphemeralImagePaginator(discord.ui.View):
 
     @discord.ui.button(label="💾 Lưu ảnh", style=discord.ButtonStyle.success, custom_id="epaginator:save")
     async def save_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        # Cùng nguyên tắc: defer() trước, mọi DB call sau — xem ghi chú ở
-        # _paginator_navigate() phía trên. Dùng _timed_defer() dùng chung
-        # để có timing thống nhất trên mọi lệnh gọi defer() trong bot.
-        if not await _timed_defer(interaction, ephemeral=True):
-            return
+        await _do_epaginator_save(interaction)
 
-        message_id = str(interaction.message.id)
-        session = await bot.loop.run_in_executor(None, db.get_paginator_session, message_id)
-        if not session:
-            await interaction.followup.send("⚠️ Không tìm thấy dữ liệu ảnh này nữa.", ephemeral=True)
-            return
-        if interaction.user.id != session["author_id"]:
-            await interaction.followup.send("⚠️ Bạn không thể lưu ảnh của người khác.", ephemeral=True)
-            return
 
-        url = session["images"][session["index"]]
-        label = session["label"]
+async def _do_epaginator_save(interaction: discord.Interaction):
+    """
+    Logic thật của nút "💾 Lưu ảnh" — tách riêng khỏi callback trong View để
+    có thể gọi trực tiếp từ on_interaction() (dispatch thủ công), phòng
+    trường hợp ViewStore nội bộ của discord.py không khớp được item (xem
+    ghi chú dài trong on_interaction() phía trên đầu file).
+    """
+    # Cùng nguyên tắc: defer() trước, mọi DB call sau — xem ghi chú ở
+    # _paginator_navigate() phía trên. Dùng _timed_defer() dùng chung
+    # để có timing thống nhất trên mọi lệnh gọi defer() trong bot.
+    if not await _timed_defer(interaction, ephemeral=True):
+        return
 
-        # Cố gắng lấy thêm thông tin ảnh (định dạng, dung lượng) qua HEAD request.
-        # Không bắt buộc phải thành công — nếu lỗi/timeout thì bỏ qua, chỉ dùng ghi chú thường.
-        info_text = await bot.loop.run_in_executor(None, _try_get_image_info, url)
+    message_id = str(interaction.message.id)
+    session = await bot.loop.run_in_executor(None, db.get_paginator_session, message_id)
+    if not session:
+        await interaction.followup.send("⚠️ Không tìm thấy dữ liệu ảnh này nữa.", ephemeral=True)
+        return
+    if interaction.user.id != session["author_id"]:
+        await interaction.followup.send("⚠️ Bạn không thể lưu ảnh của người khác.", ephemeral=True)
+        return
 
-        dm_embed = discord.Embed(title=f"💾 Ảnh đã lưu — {label}", description="✅ Gửi theo yêu cầu lưu ảnh của bạn.", color=discord.Color.green())
-        dm_embed.set_image(url=url)
-        if info_text:
-            dm_embed.add_field(name="Thông tin ảnh", value=info_text, inline=False)
+    url = session["images"][session["index"]]
+    label = session["label"]
 
-        dm_ok = False
-        dm_error_text = None
-        try:
-            await interaction.user.send(embed=dm_embed)
-            dm_ok = True
-        except discord.Forbidden:
-            dm_error_text = "Tài khoản của bạn đang tắt nhận tin nhắn riêng (DM) từ thành viên server này."
-        except discord.HTTPException as e:
-            dm_error_text = f"Lỗi khi gửi tin nhắn riêng qua Discord: {e}"
-        except Exception as e:
-            dm_error_text = f"Lỗi không xác định khi gửi tin nhắn riêng: {e}"
+    # Cố gắng lấy thêm thông tin ảnh (định dạng, dung lượng) qua HEAD request.
+    # Không bắt buộc phải thành công — nếu lỗi/timeout thì bỏ qua, chỉ dùng ghi chú thường.
+    info_text = await bot.loop.run_in_executor(None, _try_get_image_info, url)
 
-        if dm_ok:
-            await interaction.followup.send("✅ Đã gửi ảnh vào tin nhắn riêng (DM) của bạn.", ephemeral=True)
-            return
+    dm_embed = discord.Embed(title=f"💾 Ảnh đã lưu — {label}", description="✅ Gửi theo yêu cầu lưu ảnh của bạn.", color=discord.Color.green())
+    dm_embed.set_image(url=url)
+    if info_text:
+        dm_embed.add_field(name="Thông tin ảnh", value=info_text, inline=False)
 
-        logger.warning(f"Không gửi được DM lưu ảnh cho user {interaction.user.id}: {dm_error_text}")
+    dm_ok = False
+    dm_error_text = None
+    try:
+        await interaction.user.send(embed=dm_embed)
+        dm_ok = True
+    except discord.Forbidden:
+        dm_error_text = "Tài khoản của bạn đang tắt nhận tin nhắn riêng (DM) từ thành viên server này."
+    except discord.HTTPException as e:
+        dm_error_text = f"Lỗi khi gửi tin nhắn riêng qua Discord: {e}"
+    except Exception as e:
+        dm_error_text = f"Lỗi không xác định khi gửi tin nhắn riêng: {e}"
 
-        fail_embed = discord.Embed(
-            title="⚠️ Không gửi được tin nhắn riêng (DM)",
-            description=f"**Lý do:** {dm_error_text}",
-            color=discord.Color.orange(),
-        )
-        fail_embed.set_image(url=url)
-        if info_text:
-            fail_embed.add_field(name="Thông tin ảnh", value=info_text, inline=False)
-        await interaction.followup.send(embed=fail_embed, ephemeral=True)
+    if dm_ok:
+        await interaction.followup.send("✅ Đã gửi ảnh vào tin nhắn riêng (DM) của bạn.", ephemeral=True)
+        return
+
+    logger.warning(f"Không gửi được DM lưu ảnh cho user {interaction.user.id}: {dm_error_text}")
+
+    fail_embed = discord.Embed(
+        title="⚠️ Không gửi được tin nhắn riêng (DM)",
+        description=f"**Lý do:** {dm_error_text}",
+        color=discord.Color.orange(),
+    )
+    fail_embed.set_image(url=url)
+    if info_text:
+        fail_embed.add_field(name="Thông tin ảnh", value=info_text, inline=False)
+    await interaction.followup.send(embed=fail_embed, ephemeral=True)
 
 
 EPHEMERAL_PAGINATOR_VIEW = EphemeralImagePaginator()
@@ -888,71 +922,81 @@ class ShowcaseStartView(discord.ui.View):
 
     @discord.ui.button(label="🎲 Bắt đầu", style=discord.ButtonStyle.primary, custom_id="showcase:start")
     async def start_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        # QUAN TRỌNG: defer() phải là việc ĐẦU TIÊN, trước mọi DB call/check
-        # bên dưới. Discord chỉ cho 3 giây để phản hồi ban đầu (kể cả defer);
-        # nếu Mongo chậm/chập chờn, 4 bước check phía dưới (get_showcase_board,
-        # get_all_categories_async, check_access...) cộng dồn có thể vượt 3
-        # giây, khiến Discord huỷ interaction ("không phản hồi kịp thời")
-        # trước khi code kịp defer. Defer trước rồi mới check sẽ không còn
-        # giới hạn 3 giây nữa (chỉ còn giới hạn 15 phút của followup).
-        #
-        # Bọc try/except quanh defer() qua _timed_defer() dùng chung — đo
-        # timing thống nhất trên mọi lệnh gọi defer() trong bot, giúp xác
-        # nhận defer() có thực sự là nguồn gây timeout hay không (khác với
-        # self-test soak trước đây, chỉ đo được message.edit() thường, không
-        # đo được đúng API defer() thật).
-        if not await _timed_defer(interaction, ephemeral=True):
-            return
+        await _do_showcase_start(interaction)
 
-        message_id = str(interaction.message.id)
-        board = await bot.loop.run_in_executor(None, db.get_showcase_board, message_id)
-        if not board:
-            await interaction.followup.send(
-                "❌ Bảng giới thiệu này thiếu dữ liệu (có thể tạo từ bản bot cũ), không dùng được nữa.",
-                ephemeral=True,
-            )
-            return
 
-        category_key = board["category_key"]
-        all_cats = await get_all_categories_async()
-        info = all_cats.get(category_key)
-        if not info:
-            await interaction.followup.send("❌ Chủ đề này không còn tồn tại nữa.", ephemeral=True)
-            return
-        if info.get("nsfw") and not _channel_allows_nsfw(interaction.channel):
-            await interaction.followup.send(
-                "🔞 Chủ đề này chỉ dùng được ở kênh đã đánh dấu Age-Restricted (NSFW).", ephemeral=True
-            )
-            return
+async def _do_showcase_start(interaction: discord.Interaction):
+    """
+    Logic thật của nút "🎲 Bắt đầu" — tách riêng khỏi callback trong View để
+    có thể gọi trực tiếp từ on_interaction() (dispatch thủ công), phòng
+    trường hợp ViewStore nội bộ của discord.py không khớp được item (xem
+    ghi chú dài trong on_interaction() phía trên đầu file).
+    """
+    # QUAN TRỌNG: defer() phải là việc ĐẦU TIÊN, trước mọi DB call/check
+    # bên dưới. Discord chỉ cho 3 giây để phản hồi ban đầu (kể cả defer);
+    # nếu Mongo chậm/chập chờn, 4 bước check phía dưới (get_showcase_board,
+    # get_all_categories_async, check_access...) cộng dồn có thể vượt 3
+    # giây, khiến Discord huỷ interaction ("không phản hồi kịp thời")
+    # trước khi code kịp defer. Defer trước rồi mới check sẽ không còn
+    # giới hạn 3 giây nữa (chỉ còn giới hạn 15 phút của followup).
+    #
+    # Bọc try/except quanh defer() qua _timed_defer() dùng chung — đo
+    # timing thống nhất trên mọi lệnh gọi defer() trong bot, giúp xác
+    # nhận defer() có thực sự là nguồn gây timeout hay không (khác với
+    # self-test soak trước đây, chỉ đo được message.edit() thường, không
+    # đo được đúng API defer() thật).
+    if not await _timed_defer(interaction, ephemeral=True):
+        return
 
-        roles = getattr(interaction.user, "roles", None)
-        access_err = await check_access(interaction.user.id, interaction.guild_id, interaction.channel_id, roles)
-        if access_err:
-            await interaction.followup.send(access_err, ephemeral=True)
-            return
-        wait = check_cooldown(interaction.user.id)
-        if wait:
-            await interaction.followup.send(f"⏳ Chờ thêm {wait}s rồi thử lại nhé.", ephemeral=True)
-            return
-        mark_used(interaction.user.id)
-
-        url = await _fetch_next_image_url(category_key, info["keyword"], [])
-        if not url:
-            eta = await _next_crawl_eta_text()
-            await interaction.followup.send(
-                f"❌ Không tìm thấy ảnh nào cho chủ đề: **{info['label']}**. "
-                f"Lần crawl kế tiếp {eta}.",
-                ephemeral=True,
-            )
-            return
-
-        async def send_func(embed, view):
-            return await interaction.followup.send(embed=embed, view=view, ephemeral=True, wait=True)
-
-        await _send_image_result(
-            send_func, category_key, info["label"], info["keyword"], url, interaction.user.id,
-            view=EPHEMERAL_PAGINATOR_VIEW,
+    message_id = str(interaction.message.id)
+    board = await bot.loop.run_in_executor(None, db.get_showcase_board, message_id)
+    if not board:
+        await interaction.followup.send(
+            "❌ Bảng giới thiệu này thiếu dữ liệu (có thể tạo từ bản bot cũ), không dùng được nữa.",
+            ephemeral=True,
         )
+        return
+
+    category_key = board["category_key"]
+    all_cats = await get_all_categories_async()
+    info = all_cats.get(category_key)
+    if not info:
+        await interaction.followup.send("❌ Chủ đề này không còn tồn tại nữa.", ephemeral=True)
+        return
+    if info.get("nsfw") and not _channel_allows_nsfw(interaction.channel):
+        await interaction.followup.send(
+            "🔞 Chủ đề này chỉ dùng được ở kênh đã đánh dấu Age-Restricted (NSFW).", ephemeral=True
+        )
+        return
+
+    roles = getattr(interaction.user, "roles", None)
+    access_err = await check_access(interaction.user.id, interaction.guild_id, interaction.channel_id, roles)
+    if access_err:
+        await interaction.followup.send(access_err, ephemeral=True)
+        return
+    wait = check_cooldown(interaction.user.id)
+    if wait:
+        await interaction.followup.send(f"⏳ Chờ thêm {wait}s rồi thử lại nhé.", ephemeral=True)
+        return
+    mark_used(interaction.user.id)
+
+    url = await _fetch_next_image_url(category_key, info["keyword"], [])
+    if not url:
+        eta = await _next_crawl_eta_text()
+        await interaction.followup.send(
+            f"❌ Không tìm thấy ảnh nào cho chủ đề: **{info['label']}**. "
+            f"Lần crawl kế tiếp {eta}.",
+            ephemeral=True,
+        )
+        return
+
+    async def send_func(embed, view):
+        return await interaction.followup.send(embed=embed, view=view, ephemeral=True, wait=True)
+
+    await _send_image_result(
+        send_func, category_key, info["label"], info["keyword"], url, interaction.user.id,
+        view=EPHEMERAL_PAGINATOR_VIEW,
+    )
 
 
 SHOWCASE_VIEW = ShowcaseStartView()
