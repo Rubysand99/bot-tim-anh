@@ -359,9 +359,38 @@ async def _before_self_test_loop():
 
 
 @bot.event
+async def on_interaction(interaction: discord.Interaction):
+    """
+    CHẨN ĐOÁN TẠM THỜI — logger "nghe lén" thô, độc lập hoàn toàn với
+    add_view()/ViewStore của discord.py. Sự kiện 'interaction' được
+    ConnectionState.dispatch() gọi SONG SONG với, KHÔNG thay thế, cơ chế
+    khớp view nội bộ — nên thêm handler này an toàn 100%, không ảnh hưởng
+    nút bấm/slash command đang chạy.
+    Mục đích: nếu bấm nút mà dòng log [RAW interaction] bên dưới VẪN không
+    xuất hiện -> chứng minh sự kiện chưa từng tới tiến trình này (lỗi nằm
+    ở tầng Discord/gateway, ngoài tầm code). Nếu dòng này XUẤT HIỆN nhưng
+    callback nút (_timed_defer...) vẫn không chạy -> chứng minh sự kiện có
+    tới nơi, nhưng discord.py không khớp được vào persistent view nào ->
+    bug nằm ở add_view()/ViewStore, cần hướng xử lý khác hẳn (vd: bỏ cơ chế
+    persistent, tự dispatch thủ công ngay trong handler này).
+    Xoá khối này sau khi đã xác định xong nguyên nhân.
+    """
+    try:
+        custom_id = interaction.data.get("custom_id") if interaction.data else None
+        msg_id = getattr(interaction.message, "id", None) if interaction.message else None
+        logger.info(
+            f"[RAW interaction] type={interaction.type!r} custom_id={custom_id!r} "
+            f"message_id={msg_id} user={interaction.user.id} responded={interaction.response.is_done()}"
+        )
+    except Exception as e:
+        logger.warning(f"[RAW interaction] Lỗi khi log interaction thô: {e}")
+
+
+@bot.event
 async def on_ready():
     global _persistent_view_ready
     logger.info(f"Bot đã đăng nhập thành công với tên: {bot.user}")
+    logger.info(f"[diag] discord.py version: {discord.__version__} | file: {discord.__file__}")
 
     # Làm nóng kết nối MongoDB ngay lúc khởi động, chạy NỀN (không await ở
     # đây, không chặn các bước bên dưới). Lý do: get_db() lần gọi ĐẦU TIÊN
