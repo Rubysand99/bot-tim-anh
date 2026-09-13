@@ -4,5 +4,5 @@ Số bản của bot — cập nhật mỗi khi thêm tính năng/sửa lỗi đ
 Chỉ cần sửa 2 biến bên dưới, không cần đụng vào bot.py.
 """
 
-__version__ = "1.9.0"
-__description__ = "Fix nút bấm (Trước/Sau/Bắt đầu) im lặng không phản hồi do bug ViewStore của discord.py 2.7.1 — dispatch thủ công qua on_interaction thay vì add_view(). Thêm: tải trước (prefetch) ảnh kế tiếp để bấm Sau ra ảnh ngay; nhiều từ khóa/category (/addcategory, /editcategory); /stats hiện thêm từ khóa + NSFW mỗi category."
+__version__ = "1.10.0"
+__description__ = "Thêm /mergecategory (gộp ảnh + từ khóa 2 chủ đề làm 1), /random random ảnh mới mỗi lần bấm Sau (có thể khác category), /stats hiện thêm slug/NSFW rõ ràng. Fix: defer() phải chạy TRƯỚC get_all_categories_async() ở /mergecategory, /cleanup, /showcase — gọi sai thứ tự gây 'Interaction đã hết hạn' khi cache category vừa bị invalidate (lỗi thực tế xảy ra 13/09 khi dùng /mergecategory ngay sau /removecategory)."

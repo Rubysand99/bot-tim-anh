@@ -1681,16 +1681,27 @@ async def mergecategory_slash(interaction: discord.Interaction, from_slug: str, 
         await interaction.response.send_message("⚠️ 2 chủ đề phải khác nhau.", ephemeral=True)
         return
 
-    all_cats = await get_all_categories_async()
-    if from_slug not in all_cats:
-        await interaction.response.send_message(f"❌ Không tìm thấy chủ đề nguồn `{from_slug}`.", ephemeral=True)
-        return
-    if to_slug not in all_cats:
-        await interaction.response.send_message(f"❌ Không tìm thấy chủ đề đích `{to_slug}`.", ephemeral=True)
-        return
-
+    # QUAN TRỌNG: defer() TRƯỚC get_all_categories_async() — nguyên tắc
+    # xuyên suốt cả bot (xem _paginator_navigate, _do_showcase_start...).
+    # Lỗi thực tế đã xảy ra: get_all_categories_async() đọc cache category
+    # trong RAM, nhưng NẾU cache vừa bị _invalidate_categories_cache() xoá
+    # (vd do vừa chạy /removecategory hoặc /addcategory ngay trước đó), lần
+    # gọi kế tiếp phải đọc lại MongoDB từ đầu — nếu đúng lúc Mongo hơi chậm,
+    # tổng thời gian trước khi kịp defer() có thể vượt quá 3 giây Discord
+    # cho phép, gây "Interaction đã hết hạn trước khi kịp defer()" (đã thấy
+    # trong log thực tế ngày 13/09 lúc dùng /mergecategory ngay sau
+    # /removecategory).
     if not await _timed_defer(interaction, ephemeral=True):
         return
+
+    all_cats = await get_all_categories_async()
+    if from_slug not in all_cats:
+        await interaction.followup.send(f"❌ Không tìm thấy chủ đề nguồn `{from_slug}`.")
+        return
+    if to_slug not in all_cats:
+        await interaction.followup.send(f"❌ Không tìm thấy chủ đề đích `{to_slug}`.")
+        return
+
     await interaction.followup.send(await _do_merge_category(from_slug, to_slug))
 
 
@@ -1765,12 +1776,15 @@ async def cleanup_slash(interaction: discord.Interaction, chu_de: str):
         await interaction.response.send_message("⚠️ Chỉ admin mới dùng được lệnh này.", ephemeral=True)
         return
 
-    all_cats = await get_all_categories_async()
-    if chu_de not in all_cats:
-        await interaction.response.send_message(f"❌ Chủ đề không hợp lệ: {chu_de}", ephemeral=True)
+    # defer() TRƯỚC get_all_categories_async() — xem ghi chú chi tiết ở
+    # mergecategory_slash (lỗi thực tế đã xảy ra khi cache category vừa bị
+    # invalidate, khiến lần đọc kế tiếp chậm hơn 3 giây).
+    if not await _timed_defer(interaction):
         return
 
-    if not await _timed_defer(interaction):
+    all_cats = await get_all_categories_async()
+    if chu_de not in all_cats:
+        await interaction.followup.send(f"❌ Chủ đề không hợp lệ: {chu_de}")
         return
     report = await bot.loop.run_in_executor(None, _cleanup_category, chu_de)
     await interaction.followup.send(f"🧹 **{all_cats[chu_de]['label']}**: {report}")
@@ -1825,20 +1839,23 @@ async def showcase_slash(interaction: discord.Interaction, chu_de: str, kenh: di
         await interaction.response.send_message("⚠️ Chỉ admin mới dùng được lệnh này.", ephemeral=True)
         return
 
+    # defer() TRƯỚC get_all_categories_async() — xem ghi chú chi tiết ở
+    # mergecategory_slash (lỗi thực tế đã xảy ra khi cache category vừa bị
+    # invalidate, khiến lần đọc kế tiếp chậm hơn 3 giây).
+    if not await _timed_defer(interaction, ephemeral=True):
+        return
+
     all_cats = await get_all_categories_async()
     info = all_cats.get(chu_de)
     if not info:
-        await interaction.response.send_message(f"❌ Chủ đề không hợp lệ: {chu_de}", ephemeral=True)
+        await interaction.followup.send(f"❌ Chủ đề không hợp lệ: {chu_de}")
         return
 
     target_channel = kenh or interaction.channel
     if info.get("nsfw") and not _channel_allows_nsfw(target_channel):
-        await interaction.response.send_message(
-            f"🔞 Chủ đề **{info['label']}** là NSFW, chỉ đăng được vào kênh đã đánh dấu Age-Restricted.",
-            ephemeral=True,
+        await interaction.followup.send(
+            f"🔞 Chủ đề **{info['label']}** là NSFW, chỉ đăng được vào kênh đã đánh dấu Age-Restricted."
         )
-        return
-    if not await _timed_defer(interaction, ephemeral=True):
         return
 
     message, error = await _post_showcase_board(target_channel, chu_de, info, interaction.user.id)
