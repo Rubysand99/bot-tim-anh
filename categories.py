@@ -1,17 +1,24 @@
-# Danh sách category ảnh + từ khóa dùng để crawl trên Pinterest.
-# "label" = tên hiển thị trong Discord (dropdown chọn chủ đề).
+# Category ảnh giờ KHÔNG còn cấu hình sẵn trong code nữa — toàn bộ chủ đề
+# sống trong MongoDB, thêm/sửa/xoá/gộp hoàn toàn qua lệnh Discord
+# (/addcategory, /editcategory, /removecategory, /mergecategory). Để trống
+# dict này — không thêm category trực tiếp vào đây nữa.
+#
 # "keywords" = DANH SÁCH từ khóa search Pinterest khi crawl (1 category có
 #              thể gộp nhiều từ khóa, vd category "cá" có thể crawl bằng
 #              cả "cá heo" lẫn "cá mập" — ảnh crawl được từ mọi từ khóa đều
 #              lưu chung dưới 1 category, không phân biệt từ khóa nào tìm ra).
-# "nsfw" = True nếu chủ đề này chỉ nên hiển thị ở kênh Discord đã đánh dấu
-#          Age-Restricted (nsfw). Mặc định False cho mọi category bên dưới —
-#          tự sửa lại True nếu bạn thấy chủ đề nào cần giới hạn kênh.
-#
-# Muốn thêm/sửa/xoá category: chỉnh trực tiếp dict bên dưới.
-# Lưu ý: Discord slash command chỉ cho tối đa 25 lựa chọn (choices).
+# "nsfw" = True nếu chủ đề chỉ nên hiển thị ở kênh Discord đã đánh dấu
+#          Age-Restricted (nsfw).
+CATEGORIES = {}
 
-CATEGORIES = {
+# Danh sách category CŨ từng cấu hình cứng trong file này — giữ lại DUY
+# NHẤT để lệnh /migratecategories (bot.py) đọc 1 LẦN rồi chuyển hết sang
+# MongoDB dưới dạng category thêm qua lệnh (custom). Sau khi đã chạy
+# /migratecategories thành công (bot báo "Đã chuyển ... chủ đề"), khối này
+# không còn tác dụng gì nữa — có thể xoá hẳn nếu muốn dọn code, không bắt
+# buộc phải xoá (để trống hay để nguyên đều không ảnh hưởng gì, vì CATEGORIES
+# ở trên mới là dict thật sự được bot dùng).
+_LEGACY_STATIC_CATEGORIES = {
     "sylphiette": {"label": "Sylphiette>_<", "keywords": ["sylphiette greyrat"], "nsfw": False},
     "gaixinh": {"label": "Hot girl vn", "keywords": ["khoe dáng"], "nsfw": False},
     "gaicute": {"label": "bổ sung vitamin A 😋", "keywords": ["gái xinh"], "nsfw": False},

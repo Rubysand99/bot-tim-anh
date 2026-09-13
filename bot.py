@@ -12,7 +12,7 @@ import requests
 from discord import app_commands
 from discord.ext import commands, tasks
 from keep_alive import keep_alive
-from categories import CATEGORIES, get_keywords, keywords_display
+from categories import CATEGORIES, _LEGACY_STATIC_CATEGORIES, get_keywords, keywords_display
 import db
 import crawl_job
 from version import __version__, __description__
@@ -1631,6 +1631,62 @@ async def removecategory_prefix(ctx, slug: str = None):
         await ctx.send(f"✅ Đã xoá chủ đề `{slug}`.")
     else:
         await ctx.send(f"❌ Không tìm thấy chủ đề `{slug}` trong danh sách đã thêm.")
+
+
+async def _do_migrate_categories() -> str:
+    """
+    Chuyển hết category từng cấu hình cứng trong categories.py (khối
+    _LEGACY_STATIC_CATEGORIES) sang MongoDB dưới dạng category thêm qua
+    lệnh (custom) — để KHÔNG còn category nào sống trong code nữa, mọi thứ
+    quản lý qua /addcategory /editcategory /removecategory /mergecategory.
+    An toàn khi chạy nhiều lần (idempotent): category nào đã có sẵn trong
+    MongoDB rồi (trùng slug) thì bỏ qua, không ghi đè.
+    """
+    migrated = []
+    skipped = []
+    for slug, info in _LEGACY_STATIC_CATEGORIES.items():
+        exists = await bot.loop.run_in_executor(None, db.custom_category_exists, slug)
+        if exists:
+            skipped.append(slug)
+            continue
+        await bot.loop.run_in_executor(
+            None, db.add_custom_category, slug, info["label"], get_keywords(info), info.get("nsfw", False)
+        )
+        migrated.append(slug)
+    _invalidate_categories_cache()
+
+    lines = []
+    if migrated:
+        lines.append(f"✅ Đã chuyển {len(migrated)} chủ đề vào MongoDB: `{', '.join(migrated)}`")
+    if skipped:
+        lines.append(f"⏭️ Bỏ qua {len(skipped)} chủ đề (đã có sẵn trong MongoDB từ trước): `{', '.join(skipped)}`")
+    if not migrated and not skipped:
+        lines.append("Không có chủ đề nào trong _LEGACY_STATIC_CATEGORIES để chuyển.")
+    if migrated or skipped:
+        lines.append(
+            "\nTừ giờ dùng `/editcategory` `/removecategory` `/mergecategory` được với TẤT CẢ chủ đề này rồi "
+            "(trước đây các chủ đề có sẵn trong code không sửa/xoá/gộp được qua lệnh)."
+        )
+    return "\n".join(lines)
+
+
+@bot.tree.command(name="migratecategories", description="[Admin] Chuyển category có sẵn trong code sang MongoDB (chỉ cần chạy 1 lần)")
+async def migratecategories_slash(interaction: discord.Interaction):
+    if not is_admin(interaction.user.id):
+        await interaction.response.send_message("⚠️ Chỉ admin mới dùng được lệnh này.", ephemeral=True)
+        return
+    if not await _timed_defer(interaction, ephemeral=True):
+        return
+    await interaction.followup.send(await _do_migrate_categories())
+
+
+@bot.command(name="migratecategories", help="[Admin] !migratecategories — chuyển category có sẵn trong code sang MongoDB (chỉ cần chạy 1 lần)")
+async def migratecategories_prefix(ctx):
+    if not is_admin(ctx.author.id):
+        await ctx.send("⚠️ Chỉ admin mới dùng được lệnh này.")
+        return
+    await ctx.typing()
+    await ctx.send(await _do_migrate_categories())
 
 
 async def _do_merge_category(from_slug: str, to_slug: str) -> str:
