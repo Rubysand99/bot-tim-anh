@@ -1364,18 +1364,19 @@ async def _build_stats_embed() -> discord.Embed:
     for key, info in all_cats.items():
         s = stats.get(key)
         if s is None:
-            embed.add_field(name=info["label"], value="⚠️ lỗi đọc DB", inline=False)
+            embed.add_field(name=f"{info['label']} · `{key}`", value="⚠️ lỗi đọc DB", inline=False)
             continue
         total_all += s["total"]
         available_all += s["available"]
-        nsfw_tag = " 🔞" if info.get("nsfw") else ""
+        nsfw_text = "Có 🔞" if info.get("nsfw") else "Không"
         value = (
-            f"Từ khóa: `{keywords_display(info)}`{nsfw_tag}\n"
+            f"Từ khóa: `{keywords_display(info)}`\n"
+            f"NSFW: {nsfw_text}\n"
             f"Tổng: **{s['total']}** · Khả dụng: **{s['available']}**\n"
             f"TB gửi: {s['avg_sent_count']} lần/ảnh (cao nhất {s['max_sent_count']})\n"
             f"Ảnh mới nhất: {_relative_time_vi(s['newest_created_at'])}"
         )
-        embed.add_field(name=info["label"], value=value, inline=True)
+        embed.add_field(name=f"{info['label']} · `{key}`", value=value, inline=True)
 
     custom_count = len(all_cats) - len(CATEGORIES)
     embed.description = (
