@@ -772,6 +772,10 @@ async def _paginator_navigate(interaction: discord.Interaction, direction: int, 
         )
         return
 
+    if session.get("mode") == "random":
+        await _paginator_navigate_random(interaction, direction, view, session, message_id)
+        return
+
     images = session["images"]
     index = session["index"]
     category_key = session["category_key"]
@@ -811,6 +815,56 @@ async def _paginator_navigate(interaction: discord.Interaction, direction: int, 
     await interaction.edit_original_response(embed=_build_image_embed(session["label"], new_url), view=view)
     await bot.loop.run_in_executor(None, db.append_image_and_set_index, message_id, new_url, index)
     _maybe_schedule_prefetch(message_id, category_key, images + [new_url], index)
+
+
+async def _paginator_navigate_random(interaction: discord.Interaction, direction: int, view: discord.ui.View,
+                                      session: dict, message_id: str):
+    """
+    Bản dành riêng cho phiên /random: khác phiên /img ở chỗ MỖI ảnh trong
+    "items" có thể thuộc 1 category khác nhau (random thật trên toàn kho,
+    không cố định 1 category cho cả phiên như /img) — nên embed phải lấy
+    label từ CHÍNH ảnh đang xem (item["label"]), không dùng 1 label chung
+    cho cả session. Logic tải trước/đổi thứ tự ghi Mongo giống hệt
+    _paginator_navigate ở trên, chỉ khác nguồn lấy ảnh mới (random toàn kho
+    qua _pick_random_image thay vì next_image của đúng 1 category).
+    """
+    items = session["items"]
+    index = session["index"]
+    allowed_keys = session.get("allowed_keys") or []
+    all_cats = await get_all_categories_async()
+
+    if direction < 0:
+        index = max(0, index - 1)
+        item = items[index]
+        await interaction.edit_original_response(embed=_build_image_embed(item["label"], item["url"]), view=view)
+        await bot.loop.run_in_executor(None, db.update_paginator_index, message_id, index)
+        return
+
+    if index < len(items) - 1:
+        index += 1
+        item = items[index]
+        await interaction.edit_original_response(embed=_build_image_embed(item["label"], item["url"]), view=view)
+        await bot.loop.run_in_executor(None, db.update_paginator_index, message_id, index)
+        _maybe_schedule_random_prefetch(message_id, all_cats, allowed_keys, items, index)
+        return
+
+    exclude_urls = [i["url"] for i in items]
+    result = await _pick_random_image(all_cats, allowed_keys, exclude_urls)
+    if not result:
+        eta = await _next_crawl_eta_text()
+        await interaction.followup.send(
+            f"❌ Hết ảnh khả dụng rồi. Kho ảnh tự làm mới mỗi "
+            f"{CRAWL_INTERVAL_HOURS} tiếng — lần crawl kế tiếp {eta}.",
+            ephemeral=True,
+        )
+        return
+
+    category_key, label, url = result
+    index += 1
+    new_item = {"url": url, "category_key": category_key, "label": label}
+    await interaction.edit_original_response(embed=_build_image_embed(label, url), view=view)
+    await bot.loop.run_in_executor(None, db.append_random_item_and_set_index, message_id, new_item, index)
+    _maybe_schedule_random_prefetch(message_id, all_cats, allowed_keys, items + [new_item], index)
 
 
 class PersistentImagePaginator(discord.ui.View):
@@ -1144,8 +1198,36 @@ async def img_prefix(ctx, chu_de: str = None):
 # (không phải random category rồi mới chọn ảnh trong đó).
 # ============================================================
 
+async def _pick_random_image(all_cats: dict, allowed_keys: list, exclude_urls: list):
+    """
+    Lõi chọn 1 ảnh random dùng CHUNG cho: lệnh /random lần đầu, mỗi lần bấm
+    "Sau" trong phiên /random (hết ảnh đệm), và tác vụ tải trước (prefetch)
+    của phiên /random. Trả về (category_key, label, url) hoặc None nếu hết
+    ảnh khả dụng trong phạm vi allowed_keys.
+    """
+    if not allowed_keys:
+        return None
+    doc = await bot.loop.run_in_executor(None, db.get_random_image, exclude_urls, allowed_keys)
+    if doc:
+        category_key = doc["category"]
+        info = all_cats.get(category_key, {"label": category_key, "keywords": [category_key]})
+        return category_key, info["label"], doc["image_url"]
+
+    # DB trống hoàn toàn ảnh khả dụng (trong phạm vi allowed_keys) -> thử
+    # random 1 chủ đề khác (vẫn trong allowed_keys) qua _fetch_next_image_url
+    # (chỉ đọc DB, không cào Pinterest trực tiếp nữa — xem ghi chú đầu file).
+    category_key = random.choice(allowed_keys)
+    info = all_cats[category_key]
+    url = await _fetch_next_image_url(category_key, exclude_urls)
+    if not url:
+        return None
+    return category_key, info["label"], url
+
+
 async def _get_random_image_result(channel):
-    """Trả về (category_key, label, keywords_text, url) hoặc (None, None, None, None) nếu hết ảnh."""
+    """Trả về (category_key, label, url, allowed_keys) hoặc (None, None, None, None) nếu hết ảnh.
+    allowed_keys được trả về luôn để lưu vào phiên /random — dùng lại cho
+    prefetch trong nền, không cần tính lại lần nữa."""
     all_cats = await get_all_categories_async()
     channel_nsfw_ok = _channel_allows_nsfw(channel)
 
@@ -1156,22 +1238,48 @@ async def _get_random_image_result(channel):
     if not allowed_keys:
         return None, None, None, None
 
-    doc = await bot.loop.run_in_executor(None, db.get_random_image, None, allowed_keys)
-
-    if doc:
-        category_key = doc["category"]
-        info = all_cats.get(category_key, {"label": category_key, "keywords": [category_key]})
-        return category_key, info["label"], keywords_display(info), doc["image_url"]
-
-    # DB trống hoàn toàn ảnh khả dụng (trong phạm vi allowed_keys) -> thử
-    # random 1 chủ đề khác (vẫn trong allowed_keys) qua _fetch_next_image_url
-    # (chỉ đọc DB, không cào Pinterest trực tiếp nữa — xem ghi chú đầu file).
-    category_key = random.choice(allowed_keys)
-    info = all_cats[category_key]
-    url = await _fetch_next_image_url(category_key, [])
-    if not url:
+    result = await _pick_random_image(all_cats, allowed_keys, [])
+    if not result:
         return None, None, None, None
-    return category_key, info["label"], keywords_display(info), url
+    category_key, label, url = result
+    return category_key, label, url, allowed_keys
+
+
+def _schedule_random_prefetch(message_id: str, all_cats: dict, allowed_keys: list, exclude_urls: list) -> None:
+    """Bản dành cho phiên /random của _schedule_prefetch — mỗi ảnh tải trước
+    có thể thuộc 1 category khác với ảnh hiện tại, nên lưu kèm cả
+    category_key/label riêng cho từng ảnh (xem save_random_paginator_session)."""
+    async def _do_prefetch():
+        try:
+            result = await _pick_random_image(all_cats, allowed_keys, exclude_urls)
+            if result:
+                category_key, label, url = result
+                item = {"url": url, "category_key": category_key, "label": label}
+                await bot.loop.run_in_executor(None, db.append_random_item_to_session, message_id, item)
+        except Exception as e:
+            logger.warning(f"[prefetch-random] Lỗi tải trước ảnh cho session {message_id}: {e}")
+
+    bot.loop.create_task(_do_prefetch())
+
+
+def _maybe_schedule_random_prefetch(message_id: str, all_cats: dict, allowed_keys: list, items: list, index: int) -> None:
+    if index >= len(items) - 1:
+        _schedule_random_prefetch(message_id, all_cats, allowed_keys, [i["url"] for i in items])
+
+
+async def _send_random_image_result(send_func, category_key: str, label: str, url: str, allowed_keys: list, author_id: int):
+    """Gửi ảnh cho /random + lưu phiên xem RIÊNG cho random (mỗi ảnh trong
+    phiên có thể thuộc category khác nhau — xem save_random_paginator_session).
+    /random luôn công khai (không ephemeral) nên luôn dùng PAGINATOR_VIEW."""
+    embed = _build_image_embed(label, url)
+    message = await send_func(embed=embed, view=PAGINATOR_VIEW)
+    message_id = str(message.id)
+    item = {"url": url, "category_key": category_key, "label": label}
+    await bot.loop.run_in_executor(
+        None, db.save_random_paginator_session, message_id, [item], allowed_keys, 0, author_id
+    )
+    all_cats = await get_all_categories_async()
+    _maybe_schedule_random_prefetch(message_id, all_cats, allowed_keys, [item], 0)
 
 
 @bot.tree.command(name="random", description="Lấy 1 ảnh ngẫu nhiên bất kỳ trong toàn bộ kho")
@@ -1190,7 +1298,7 @@ async def random_slash(interaction: discord.Interaction):
     if not await _timed_defer(interaction):
         return
 
-    category_key, label, keyword, url = await _get_random_image_result(interaction.channel)
+    category_key, label, url, allowed_keys = await _get_random_image_result(interaction.channel)
     if not url:
         eta = await _next_crawl_eta_text()
         await interaction.followup.send(f"❌ Kho ảnh hiện đang trống. Lần crawl kế tiếp {eta}.")
@@ -1199,7 +1307,7 @@ async def random_slash(interaction: discord.Interaction):
     async def send_func(embed, view):
         return await interaction.followup.send(embed=embed, view=view, wait=True)
 
-    await _send_image_result(send_func, category_key, label, keyword, url, interaction.user.id)
+    await _send_random_image_result(send_func, category_key, label, url, allowed_keys, interaction.user.id)
 
 
 @bot.command(name="random", help="Lấy 1 ảnh ngẫu nhiên bất kỳ trong toàn bộ kho")
@@ -1217,7 +1325,7 @@ async def random_prefix(ctx):
 
     await ctx.typing()
 
-    category_key, label, keyword, url = await _get_random_image_result(ctx.channel)
+    category_key, label, url, allowed_keys = await _get_random_image_result(ctx.channel)
     if not url:
         eta = await _next_crawl_eta_text()
         await ctx.send(f"❌ Kho ảnh hiện đang trống. Lần crawl kế tiếp {eta}.")
@@ -1226,7 +1334,7 @@ async def random_prefix(ctx):
     async def send_func(embed, view):
         return await ctx.send(embed=embed, view=view)
 
-    await _send_image_result(send_func, category_key, label, keyword, url, ctx.author.id)
+    await _send_random_image_result(send_func, category_key, label, url, allowed_keys, ctx.author.id)
 
 
 # ============================================================

@@ -443,6 +443,54 @@ def append_image_to_session(message_id: str, url: str) -> bool:
     return result.matched_count > 0
 
 
+# --- Phiên /random: khác phiên /img ở chỗ MỖI ẢNH có thể thuộc 1 category
+# khác nhau (random thật trên toàn kho, không cố định 1 category), nên mỗi
+# phần tử trong "items" phải tự mang theo label/category riêng của nó thay
+# vì dùng chung 1 "label" cho cả session như phiên /img. "allowed_keys" lưu
+# lại danh sách category được phép ở kênh đó (đã lọc NSFW) NGAY LÚC TẠO
+# session, để lúc tải trước (prefetch) trong nền — không có sẵn interaction/
+# channel để tự tính lại — vẫn biết chính xác phạm vi được random.
+
+@_timed
+def save_random_paginator_session(message_id: str, items: list, allowed_keys: list, index: int, author_id: int) -> None:
+    db = get_db()
+    db[PAGINATOR_SESSIONS_COLLECTION].update_one(
+        {"_id": message_id},
+        {"$set": {
+            "mode": "random",
+            "items": items,
+            "allowed_keys": allowed_keys,
+            "index": index,
+            "author_id": author_id,
+            "created_at": now_utc(),
+            "updated_at": now_utc(),
+        }},
+        upsert=True,
+    )
+
+
+@_timed
+def append_random_item_and_set_index(message_id: str, item: dict, index: int) -> None:
+    db = get_db()
+    db[PAGINATOR_SESSIONS_COLLECTION].update_one(
+        {"_id": message_id},
+        {"$push": {"items": item}, "$set": {"index": index, "updated_at": now_utc()}},
+    )
+
+
+@_timed
+def append_random_item_to_session(message_id: str, item: dict) -> bool:
+    """Tải trước (prefetch) cho phiên /random — cùng nguyên tắc $push nguyên
+    tử như append_image_to_session, chỉ khác là mỗi phần tử là 1 dict
+    {url, category_key, label} thay vì 1 URL đơn."""
+    db = get_db()
+    result = db[PAGINATOR_SESSIONS_COLLECTION].update_one(
+        {"_id": message_id},
+        {"$push": {"items": item}, "$set": {"updated_at": now_utc()}},
+    )
+    return result.matched_count > 0
+
+
 # ============================================================
 # Dọn dẹp kho ảnh
 # ============================================================
