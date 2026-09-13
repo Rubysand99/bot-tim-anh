@@ -257,6 +257,23 @@ def get_category_stats(category: str) -> dict:
     }
 
 
+@_timed
+def merge_category_images(from_slug: str, to_slug: str) -> int:
+    """Chuyển toàn bộ ảnh đang gắn category=from_slug sang category=to_slug —
+    dùng khi gộp 2 chủ đề làm 1. An toàn tuyệt đối với việc trùng lặp: index
+    unique nằm trên "image_url" cho CẢ collection (không tính theo từng
+    category), nên 1 URL không bao giờ tồn tại đồng thời ở 2 category khác
+    nhau ngay từ đầu (crawl_job.py đã tự bỏ qua URL trùng khi insert) — đổi
+    category cho ảnh đã có sẵn không bao giờ gây xung đột unique index.
+    Trả về số ảnh đã chuyển thành công."""
+    db = get_db()
+    result = db[COLLECTION_NAME].update_many(
+        {"category": from_slug},
+        {"$set": {"category": to_slug}},
+    )
+    return result.modified_count
+
+
 # ============================================================
 # Category tuỳ chỉnh — cho phép admin thêm/sửa/xoá chủ đề qua lệnh Discord
 # mà không cần sửa categories.py + deploy lại. Lưu riêng 1 collection,

@@ -12,7 +12,7 @@ import requests
 from discord import app_commands
 from discord.ext import commands, tasks
 from keep_alive import keep_alive
-from categories import CATEGORIES, keywords_display
+from categories import CATEGORIES, get_keywords, keywords_display
 import db
 import crawl_job
 from version import __version__, __description__
@@ -1631,6 +1631,93 @@ async def removecategory_prefix(ctx, slug: str = None):
         await ctx.send(f"✅ Đã xoá chủ đề `{slug}`.")
     else:
         await ctx.send(f"❌ Không tìm thấy chủ đề `{slug}` trong danh sách đã thêm.")
+
+
+async def _do_merge_category(from_slug: str, to_slug: str) -> str:
+    """Logic thật của /mergecategory, dùng chung cho slash + prefix — trả về
+    câu trả lời hoàn chỉnh để gửi cho user."""
+    all_cats = await get_all_categories_async()
+    moved = await bot.loop.run_in_executor(None, db.merge_category_images, from_slug, to_slug)
+
+    # Gộp từ khóa của from_slug vào to_slug — CHỈ khi to_slug là chủ đề
+    # custom (thêm qua lệnh). Chủ đề có sẵn trong code (categories.py) không
+    # sửa được qua lệnh, phải tự thêm từ khóa vào code nếu muốn.
+    if to_slug not in CATEGORIES:
+        from_keywords = get_keywords(all_cats[from_slug])
+        to_keywords = get_keywords(all_cats[to_slug])
+        merged_keywords = to_keywords + [k for k in from_keywords if k not in to_keywords]
+        if merged_keywords != to_keywords:
+            await bot.loop.run_in_executor(None, db.edit_custom_category, to_slug, None, merged_keywords, None)
+        keyword_note = f"\nTừ khóa đã gộp vào `{to_slug}`: `{', '.join(merged_keywords)}`"
+    else:
+        keyword_note = (
+            f"\n⚠️ `{to_slug}` là chủ đề có sẵn trong code — muốn gộp thêm từ khóa của "
+            f"`{from_slug}` thì tự thêm vào `categories.py`."
+        )
+
+    _invalidate_categories_cache()
+
+    if from_slug not in CATEGORIES:
+        remove_note = f"\n`{from_slug}` giờ đã hết ảnh (0 ảnh còn lại) — dùng `/removecategory {from_slug}` nếu muốn xoá luôn chủ đề này."
+    else:
+        remove_note = f"\n⚠️ `{from_slug}` là chủ đề có sẵn trong code — vẫn còn hiện trong danh sách, tự xoá khỏi `categories.py` nếu không cần nữa."
+
+    return f"✅ Đã chuyển **{moved}** ảnh từ `{from_slug}` sang `{to_slug}`." + keyword_note + remove_note
+
+
+@bot.tree.command(name="mergecategory", description="[Admin] Gộp toàn bộ ảnh đã crawl của 1 chủ đề vào chủ đề khác")
+@app_commands.describe(
+    from_slug="Chủ đề NGUỒN — ảnh sẽ được CHUYỂN ĐI khỏi đây (chủ đề này sẽ hết ảnh sau khi gộp)",
+    to_slug="Chủ đề ĐÍCH — ảnh sẽ được gộp VÀO đây",
+)
+async def mergecategory_slash(interaction: discord.Interaction, from_slug: str, to_slug: str):
+    if not is_admin(interaction.user.id):
+        await interaction.response.send_message("⚠️ Chỉ admin mới dùng được lệnh này.", ephemeral=True)
+        return
+
+    from_slug = from_slug.strip().lower()
+    to_slug = to_slug.strip().lower()
+    if from_slug == to_slug:
+        await interaction.response.send_message("⚠️ 2 chủ đề phải khác nhau.", ephemeral=True)
+        return
+
+    all_cats = await get_all_categories_async()
+    if from_slug not in all_cats:
+        await interaction.response.send_message(f"❌ Không tìm thấy chủ đề nguồn `{from_slug}`.", ephemeral=True)
+        return
+    if to_slug not in all_cats:
+        await interaction.response.send_message(f"❌ Không tìm thấy chủ đề đích `{to_slug}`.", ephemeral=True)
+        return
+
+    if not await _timed_defer(interaction, ephemeral=True):
+        return
+    await interaction.followup.send(await _do_merge_category(from_slug, to_slug))
+
+
+@bot.command(name="mergecategory", help="[Admin] !mergecategory slug_nguồn | slug_đích — gộp toàn bộ ảnh của slug_nguồn vào slug_đích")
+async def mergecategory_prefix(ctx, *, args: str = None):
+    if not is_admin(ctx.author.id):
+        await ctx.send("⚠️ Chỉ admin mới dùng được lệnh này.")
+        return
+    if not args or args.count("|") != 1:
+        await ctx.send("⚠️ Cú pháp: `!mergecategory slug_nguồn | slug_đích`")
+        return
+
+    from_slug, to_slug = [p.strip().lower() for p in args.split("|")]
+    if from_slug == to_slug:
+        await ctx.send("⚠️ 2 chủ đề phải khác nhau.")
+        return
+
+    all_cats = await get_all_categories_async()
+    if from_slug not in all_cats:
+        await ctx.send(f"❌ Không tìm thấy chủ đề nguồn `{from_slug}`.")
+        return
+    if to_slug not in all_cats:
+        await ctx.send(f"❌ Không tìm thấy chủ đề đích `{to_slug}`.")
+        return
+
+    await ctx.typing()
+    await ctx.send(await _do_merge_category(from_slug, to_slug))
 
 
 # ============================================================
