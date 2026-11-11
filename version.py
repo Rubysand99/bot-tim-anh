@@ -4,5 +4,5 @@ Số bản của bot — cập nhật mỗi khi thêm tính năng/sửa lỗi đ
 Chỉ cần sửa 2 biến bên dưới, không cần đụng vào bot.py.
 """
 
-__version__ = "1.12.0"
-__description__ = "Thêm nút 🚫 Báo lỗi ảnh; ảnh tải trước chỉ giữ chỗ 10 phút (không tính đã gửi cho tới khi người dùng thật sự xem); phiên xem ảnh tự xoá sau 90 ngày; /stats nhanh hơn (1 truy vấn); crawl_job cảnh báo chủ đề lỗi liên tiếp; thêm unit test + CI."
+__version__ = "1.13.0"
+__description__ = "Tách bot.py (2500 dòng) thành các module core/viewer/cmd_* cho dễ bảo trì — không đổi hành vi."

@@ -33,7 +33,9 @@ except Exception:  # pragma: no cover
 os.environ.setdefault("ALLOWED_CHANNEL_IDS", "1")
 os.environ.setdefault("ALLOWED_ROLE_IDS", "")
 
-import bot as botmod  # noqa: E402
+import core  # noqa: E402
+import viewer  # noqa: E402
+import bot as entry  # noqa: E402  (import toàn bộ cmd_* để đăng ký lệnh)
 import crawl_job  # noqa: E402
 import db  # noqa: E402
 
@@ -43,35 +45,50 @@ class FakeLoop:
         return fn(*args)
 
 
-botmod.bot = SimpleNamespace(loop=FakeLoop())
+ORIGINAL_BOT = core.bot  # đối tượng bot THẬT dùng chung, lưu lại trước khi thay bản giả
+for _m in (core, viewer):
+    _m.bot = SimpleNamespace(loop=FakeLoop())
 
 
 def run(coro):
     return asyncio.run(coro)
 
 
+class StructureTests(unittest.TestCase):
+    def test_all_command_modules_register_commands_on_shared_bot(self):
+        # bot.py import đủ module lệnh, và mọi module dùng CHUNG 1 đối tượng bot.
+        import cmd_admin, cmd_basic, cmd_categories, cmd_images, cmd_showcase  # noqa: E401
+        for m in (cmd_admin, cmd_basic, cmd_categories, cmd_images, cmd_showcase, entry):
+            self.assertIs(m.bot, ORIGINAL_BOT, m.__name__)
+
+    def test_dispatch_table_has_all_buttons(self):
+        for cid in ("paginator:prev", "paginator:next", "paginator:report", "epaginator:prev",
+                    "epaginator:next", "epaginator:save", "epaginator:report", "showcase:start"):
+            self.assertIn(cid, entry._COMPONENT_DISPATCH_TABLE)
+
+
 class CheckAccessTests(unittest.TestCase):
     def setUp(self):
-        botmod.ALLOWED_CHANNEL_IDS = {1}
-        botmod.ALLOWED_ROLE_IDS = set()
+        core.ALLOWED_CHANNEL_IDS = {1}
+        core.ALLOWED_ROLE_IDS = set()
         self.cfgs = {
             10: {"allowed_channel_ids": [], "allowed_role_ids": [], "configured": False},
             20: {"allowed_channel_ids": [], "allowed_role_ids": [], "configured": True},
             30: {"allowed_channel_ids": [5], "allowed_role_ids": [], "configured": True},
         }
-        botmod.db = SimpleNamespace(get_guild_config=lambda gid: self.cfgs[gid])
-        botmod._guild_config_cache.clear()
+        core.db = SimpleNamespace(get_guild_config=lambda gid: self.cfgs[gid])
+        core._guild_config_cache.clear()
 
     def test_unconfigured_guild_uses_env_default(self):
-        self.assertNotEqual(run(botmod.check_access(111, 10, 2, [])), "")
-        self.assertEqual(run(botmod.check_access(111, 10, 1, [])), "")
+        self.assertNotEqual(run(core.check_access(111, 10, 2, [])), "")
+        self.assertEqual(run(core.check_access(111, 10, 1, [])), "")
 
     def test_cleared_guild_does_not_fall_back_to_env(self):
-        self.assertEqual(run(botmod.check_access(111, 20, 2, [])), "")
+        self.assertEqual(run(core.check_access(111, 20, 2, [])), "")
 
     def test_configured_guild_replaces_env(self):
-        self.assertEqual(run(botmod.check_access(111, 30, 5, [])), "")
-        self.assertNotEqual(run(botmod.check_access(111, 30, 1, [])), "")
+        self.assertEqual(run(core.check_access(111, 30, 5, [])), "")
+        self.assertNotEqual(run(core.check_access(111, 30, 1, [])), "")
 
 
 class CategoryCacheTests(unittest.TestCase):
@@ -83,17 +100,17 @@ class CategoryCacheTests(unittest.TestCase):
                 raise RuntimeError("mongo down")
             return {"meo": {"label": "Mèo", "keywords": ["cats"], "nsfw": False}}
 
-        botmod.db = SimpleNamespace(get_custom_categories=fake_get_custom)
-        botmod._categories_cache.update({"data": None, "at": 0.0})
-        self.assertEqual(run(botmod.get_all_categories_async()), {})
-        self.assertIsNone(botmod._categories_cache["data"])
+        core.db = SimpleNamespace(get_custom_categories=fake_get_custom)
+        core._categories_cache.update({"data": None, "at": 0.0})
+        self.assertEqual(run(core.get_all_categories_async()), {})
+        self.assertIsNone(core._categories_cache["data"])
 
         state["fail"] = False
-        self.assertIn("meo", run(botmod.get_all_categories_async()))
+        self.assertIn("meo", run(core.get_all_categories_async()))
 
-        botmod._categories_cache["at"] = time.monotonic() - 999
+        core._categories_cache["at"] = time.monotonic() - 999
         state["fail"] = True
-        self.assertIn("meo", run(botmod.get_all_categories_async()))
+        self.assertIn("meo", run(core.get_all_categories_async()))
 
 
 class CleanupTests(unittest.TestCase):
@@ -102,8 +119,8 @@ class CleanupTests(unittest.TestCase):
             if "exc" in kw:
                 raise kw["exc"]
             return SimpleNamespace(status_code=kw["code"])
-        with patch.object(botmod.requests, "head", head):
-            return botmod._check_broken("u")
+        with patch.object(viewer.requests, "head", head):
+            return viewer._check_broken("u")
 
     def test_only_404_410_are_broken(self):
         self.assertEqual(self._check(code=404), "u")
@@ -235,7 +252,7 @@ class ReportButtonTests(unittest.TestCase):
             data={"custom_id": "paginator:report"},
             edit_original_response=edit, followup=SimpleNamespace(send=followup),
         )
-        botmod.db = SimpleNamespace(
+        viewer.db = SimpleNamespace(
             get_paginator_session=lambda mid: session,
             delete_images_by_url=lambda urls: calls["deleted"].extend(urls),
             report_image=lambda url, uid: reports,
@@ -244,11 +261,11 @@ class ReportButtonTests(unittest.TestCase):
             confirm_image_sent=lambda url: calls["confirmed"].append(url),
             append_image_and_set_index=lambda mid, url, i: calls["index"].append(("append", url, i)),
         )
-        with patch.object(botmod, "_timed_defer", defer), \
-                patch.object(botmod, "_check_broken", lambda u: u if broken else None), \
-                patch.object(botmod, "_fetch_next_image_url", fetch_next), \
-                patch.object(botmod, "_build_image_embed", lambda label, url: url):
-            run(botmod._do_report_image(interaction))
+        with patch.object(viewer, "_timed_defer", defer), \
+                patch.object(viewer, "_check_broken", lambda u: u if broken else None), \
+                patch.object(viewer, "_fetch_next_image_url", fetch_next), \
+                patch.object(viewer, "_build_image_embed", lambda label, url: url):
+            run(viewer._do_report_image(interaction))
         return calls
 
     def _session(self, images, index):
@@ -266,7 +283,7 @@ class ReportButtonTests(unittest.TestCase):
         c = self._run(self._session(["a", "b"], 0), broken=False, reports=1)
         self.assertEqual(c["deleted"], [])
         self.assertEqual(c["removed"], ["a"])
-        c = self._run(self._session(["a", "b"], 0), broken=False, reports=botmod.REPORT_DELETE_THRESHOLD)
+        c = self._run(self._session(["a", "b"], 0), broken=False, reports=viewer.REPORT_DELETE_THRESHOLD)
         self.assertEqual(c["deleted"], ["a"])
 
     def test_last_image_in_session_fetches_a_new_one(self):

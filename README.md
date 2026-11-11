@@ -19,7 +19,24 @@ Pinterest trực tiếp nữa (đã bỏ hẳn, xem lý do ở mục Kiến trú
   index). Gửi cảnh báo qua Discord webhook nếu toàn bộ category lỗi hoặc có
   category sắp cạn ảnh. Ghi lại thời điểm crawl gần nhất — dùng để `bot.py`
   báo user biết còn khoảng bao lâu tới lần crawl kế tiếp khi 1 category hết ảnh.
-- **`bot.py`** — bot Discord, deploy trên Railway (xem `Procfile`). Lệnh `/img`
+- **Bot Discord** (deploy trên Railway, xem `Procfile`, điểm vào `bot.py`) —
+  từ v1.13.0 mã nguồn được tách thành các module, KHÔNG đổi hành vi:
+
+  | File | Nội dung |
+  |---|---|
+  | `bot.py` | Điểm vào: heartbeat, self-test, sự kiện (`on_ready`, `on_interaction`), bảng dispatch nút bấm, `bot.run()` |
+  | `core.py` | Cấu hình, logging, đối tượng `bot` dùng chung, kiểm tra quyền/cooldown, cache chủ đề |
+  | `viewer.py` | Lấy ảnh, phân trang (nút Trước/Sau/Báo lỗi/Lưu ảnh), prefetch, showcase view |
+  | `cmd_images.py` | `/img`, `/random` |
+  | `cmd_basic.py` | `/ping`, `/version`, `/stats` |
+  | `cmd_categories.py` | `/addcategory`, `/editcategory`, `/removecategory`, `/migratecategories`, `/mergecategory` |
+  | `cmd_admin.py` | `/cleanup`, `/config` |
+  | `cmd_showcase.py` | `/showcase`, wizard `/setup` |
+
+  Thêm lệnh mới: viết trong module `cmd_*.py` phù hợp (hoặc tạo module mới rồi
+  `import` nó trong `bot.py` — chỉ cần import là lệnh tự đăng ký lên `core.bot`).
+  Các module phụ thuộc theo 1 chiều `core` ← `viewer` ← `cmd_*` ← `bot` (không
+  import vòng). Lệnh `/img`
   lấy ảnh NGẪU NHIÊN trong category đã chọn từ MongoDB (không theo thứ tự).
   Nếu category hết ảnh khả dụng, bot báo ngay cho user (kèm ước tính thời
   gian tới lần crawl kế tiếp) thay vì tự cào Pinterest ngay lúc đó — bot
