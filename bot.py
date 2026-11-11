@@ -36,8 +36,8 @@ def _parse_id_set(env_name: str) -> set:
 # ============================================================
 # Kênh log Discord — mọi log ở mức WARNING/ERROR trong bot (lỗi crawl, lỗi
 # DB, tác vụ không thực hiện được...) sẽ tự động được gửi vào kênh này,
-# ngoài việc vẫn in ra log thường (Render logs) như trước. Bỏ trống
-# LOG_CHANNEL_ID = tắt tính năng này, chỉ log ra Render như cũ.
+# ngoài việc vẫn in ra log thường (log của Railway) như trước. Bỏ trống
+# LOG_CHANNEL_ID = tắt tính năng này, chỉ log ra Railway như cũ.
 # ============================================================
 
 _log_channel_raw = os.getenv("LOG_CHANNEL_ID", "").strip()
@@ -93,10 +93,10 @@ class DiscordAlertHandler(logging.Handler):
 
 # Admin: bỏ qua mọi giới hạn (cooldown, kênh, role) + dùng được lệnh quản trị.
 # Có thể thêm nhiều admin qua biến môi trường ADMIN_USER_IDS="id1,id2,..."
-# trên Render, không cần sửa code. Mặc định luôn có ID dưới đây.
+# trên Railway, không cần sửa code. Mặc định luôn có ID dưới đây.
 ADMIN_IDS = _parse_id_set("ADMIN_USER_IDS") or {846332174734983219}
 
-# Nếu set (comma-separated ID trên Render), lệnh ảnh chỉ dùng được ở các kênh này.
+# Nếu set (comma-separated ID trên Railway), lệnh ảnh chỉ dùng được ở các kênh này.
 # Để trống (mặc định) = không giới hạn kênh.
 ALLOWED_CHANNEL_IDS = _parse_id_set("ALLOWED_CHANNEL_IDS")
 
@@ -370,6 +370,8 @@ async def _before_self_test_loop():
 _COMPONENT_DISPATCH_TABLE = {
     "paginator:prev": lambda i: _paginator_navigate(i, -1, PAGINATOR_VIEW),
     "paginator:next": lambda i: _paginator_navigate(i, +1, PAGINATOR_VIEW),
+    "paginator:report": lambda i: _do_report_image(i),
+    "epaginator:report": lambda i: _do_report_image(i),
     "epaginator:prev": lambda i: _paginator_navigate(i, -1, EPHEMERAL_PAGINATOR_VIEW),
     "epaginator:next": lambda i: _paginator_navigate(i, +1, EPHEMERAL_PAGINATOR_VIEW),
     "epaginator:save": lambda i: _do_epaginator_save(i),
@@ -656,8 +658,11 @@ async def _next_crawl_eta_text() -> str:
     return f"khoảng {hours} tiếng {mins} phút nữa"
 
 
-async def _fetch_next_image_url(category_key: str, exclude_urls: list):
+async def _fetch_next_image_url(category_key: str, exclude_urls: list, reserve: bool = False):
     """
+    reserve=True: chỉ GIỮ CHỖ ảnh (dùng cho prefetch, xem db.RESERVE_MINUTES) —
+    ảnh chưa được coi là đã gửi cho tới khi người dùng thật sự bấm "Sau" tới nó.
+
     Lấy 1 URL ảnh khả dụng cho category, tự chữa lành nếu bốc trúng URL
     không hợp lệ (vd dài hơn 2048 ký tự — Discord sẽ từ chối cả embed với
     lỗi 400 "Invalid Form Body", phát hiện qua self-test soak). Nếu gặp URL
@@ -669,7 +674,7 @@ async def _fetch_next_image_url(category_key: str, exclude_urls: list):
 
     def fetch_db():
         try:
-            doc = db.get_next_image(category_key, exclude_urls)
+            doc = db.get_next_image(category_key, exclude_urls, reserve=reserve)
             return doc["image_url"] if doc else None
         except Exception as e:
             logger.warning(f"Lỗi đọc MongoDB khi lấy ảnh cho '{category_key}': {e}")
@@ -722,7 +727,7 @@ def _schedule_prefetch(message_id: str, category_key: str, exclude_urls: list) -
     """
     async def _do_prefetch():
         try:
-            new_url = await _fetch_next_image_url(category_key, exclude_urls)
+            new_url = await _fetch_next_image_url(category_key, exclude_urls, reserve=True)
             if new_url:
                 await bot.loop.run_in_executor(None, db.append_image_to_session, message_id, new_url)
         except Exception as e:
@@ -813,6 +818,9 @@ async def _paginator_navigate(interaction: discord.Interaction, direction: int, 
         # hiện lại đúng ảnh này, không mất dữ liệu, tự sửa ở lần bấm sau).
         await interaction.edit_original_response(embed=_build_image_embed(session["label"], images[index]), view=view)
         await bot.loop.run_in_executor(None, db.update_paginator_index, message_id, index)
+        # Ảnh đệm này mới chỉ được GIỮ CHỖ lúc tải trước — giờ người dùng thật sự
+        # xem nó nên mới tính là "đã gửi" (idempotent, bấm qua lại không tăng thêm).
+        await bot.loop.run_in_executor(None, db.confirm_image_sent, images[index])
         _maybe_schedule_prefetch(message_id, category_key, images, index)
         return
 
@@ -863,6 +871,7 @@ async def _paginator_navigate_random(interaction: discord.Interaction, direction
         item = items[index]
         await interaction.edit_original_response(embed=_build_image_embed(item["label"], item["url"]), view=view)
         await bot.loop.run_in_executor(None, db.update_paginator_index, message_id, index)
+        await bot.loop.run_in_executor(None, db.confirm_image_sent, item["url"])
         _maybe_schedule_random_prefetch(message_id, all_cats, allowed_keys, items, index)
         return
 
@@ -904,8 +913,92 @@ class PersistentImagePaginator(discord.ui.View):
     async def next_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         await _paginator_navigate(interaction, +1, self)
 
+    @discord.ui.button(label="🚫 Báo lỗi", style=discord.ButtonStyle.danger, custom_id="paginator:report")
+    async def report_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await _do_report_image(interaction)
+
 
 PAGINATOR_VIEW = PersistentImagePaginator()
+
+
+# Số người KHÁC NHAU cùng báo 1 ảnh lỗi thì ảnh bị xoá khỏi kho. Riêng ảnh mà
+# bot tự kiểm tra thấy chắc chắn đã chết (HTTP 404/410) thì xoá ngay từ lần báo
+# đầu — ngưỡng này chỉ để chống 1 người cố tình báo bừa ảnh còn dùng tốt.
+REPORT_DELETE_THRESHOLD = 3
+
+
+async def _do_report_image(interaction: discord.Interaction):
+    """Logic nút "🚫 Báo lỗi": gỡ ảnh đang xem khỏi phiên, ghi nhận báo lỗi (hoặc
+    xoá khỏi kho nếu chắc chắn hỏng / đủ người báo), rồi chuyển sang ảnh khác."""
+    if not await _timed_defer(interaction):
+        return
+
+    message_id = str(interaction.message.id)
+    session = await bot.loop.run_in_executor(None, db.get_paginator_session, message_id)
+    if not session:
+        await interaction.followup.send("⚠️ Không tìm thấy dữ liệu phiên xem ảnh này nữa.", ephemeral=True)
+        return
+    if interaction.user.id != session["author_id"]:
+        await interaction.followup.send("⚠️ Bạn không thể báo lỗi ảnh trong phiên của người khác.", ephemeral=True)
+        return
+
+    is_random = session.get("mode") == "random"
+    entries = session["items"] if is_random else session["images"]
+    index = session["index"]
+    if index >= len(entries):
+        await interaction.followup.send("⚠️ Không xác định được ảnh đang xem.", ephemeral=True)
+        return
+    url = entries[index]["url"] if is_random else entries[index]
+
+    # 1) Xoá khỏi kho nếu CHẮC CHẮN đã chết (404/410), nếu không thì chỉ ghi nhận
+    #    báo lỗi và xoá khi đủ REPORT_DELETE_THRESHOLD người khác nhau cùng báo.
+    deleted = False
+    reports = 0
+    if await bot.loop.run_in_executor(None, _check_broken, url):
+        await bot.loop.run_in_executor(None, db.delete_images_by_url, [url])
+        deleted = True
+    else:
+        reports = await bot.loop.run_in_executor(None, db.report_image, url, interaction.user.id)
+        if reports >= REPORT_DELETE_THRESHOLD:
+            await bot.loop.run_in_executor(None, db.delete_images_by_url, [url])
+            deleted = True
+
+    # 2) Gỡ khỏi phiên của người này (dù có xoá khỏi kho hay không, họ không
+    #    muốn xem lại ảnh này nữa).
+    await bot.loop.run_in_executor(None, db.remove_url_from_session, message_id, url)
+    remaining = [e for e in entries if (e["url"] if is_random else e) != url]
+
+    # 3) Chuyển sang ảnh khác: ưu tiên ảnh còn trong phiên, hết thì bốc ảnh mới.
+    view = EPHEMERAL_PAGINATOR_VIEW if str(interaction.data.get("custom_id", "")).startswith("epaginator") else PAGINATOR_VIEW
+    shown = False
+    if remaining:
+        new_index = min(index, len(remaining) - 1)
+        nxt = remaining[new_index]
+        label, nxt_url = (nxt["label"], nxt["url"]) if is_random else (session["label"], nxt)
+        await interaction.edit_original_response(embed=_build_image_embed(label, nxt_url), view=view)
+        await bot.loop.run_in_executor(None, db.update_paginator_index, message_id, new_index)
+        await bot.loop.run_in_executor(None, db.confirm_image_sent, nxt_url)
+        shown = True
+    elif is_random:
+        all_cats = await get_all_categories_async()
+        result = await _pick_random_image(all_cats, session.get("allowed_keys") or [], [url])
+        if result:
+            category_key, label, new_url = result
+            new_item = {"url": new_url, "category_key": category_key, "label": label}
+            await interaction.edit_original_response(embed=_build_image_embed(label, new_url), view=view)
+            await bot.loop.run_in_executor(None, db.append_random_item_and_set_index, message_id, new_item, 0)
+            shown = True
+    else:
+        new_url = await _fetch_next_image_url(session["category_key"], [url])
+        if new_url:
+            await interaction.edit_original_response(embed=_build_image_embed(session["label"], new_url), view=view)
+            await bot.loop.run_in_executor(None, db.append_image_and_set_index, message_id, new_url, 0)
+            shown = True
+
+    note = "🚫 Đã xoá ảnh lỗi khỏi kho." if deleted else f"🚫 Đã ghi nhận ảnh lỗi ({reports}/{REPORT_DELETE_THRESHOLD} lượt báo trước khi xoá)."
+    if not shown:
+        note += " Hiện hết ảnh khả dụng để thay thế — ảnh cũ vẫn hiển thị trên tin nhắn này."
+    await interaction.followup.send(note, ephemeral=True)
 
 
 def _try_get_image_info(url: str):
@@ -956,6 +1049,10 @@ class EphemeralImagePaginator(discord.ui.View):
     @discord.ui.button(label="💾 Lưu ảnh", style=discord.ButtonStyle.success, custom_id="epaginator:save")
     async def save_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         await _do_epaginator_save(interaction)
+
+    @discord.ui.button(label="🚫 Báo lỗi", style=discord.ButtonStyle.danger, custom_id="epaginator:report")
+    async def report_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await _do_report_image(interaction)
 
 
 async def _do_epaginator_save(interaction: discord.Interaction):
@@ -1216,8 +1313,9 @@ async def img_prefix(ctx, chu_de: str = None):
 # (không phải random category rồi mới chọn ảnh trong đó).
 # ============================================================
 
-async def _pick_random_image(all_cats: dict, allowed_keys: list, exclude_urls: list):
+async def _pick_random_image(all_cats: dict, allowed_keys: list, exclude_urls: list, reserve: bool = False):
     """
+    reserve=True: chỉ giữ chỗ ảnh (prefetch) — xem db.RESERVE_MINUTES.
     Lõi chọn 1 ảnh random dùng CHUNG cho: lệnh /random lần đầu, mỗi lần bấm
     "Sau" trong phiên /random (hết ảnh đệm), và tác vụ tải trước (prefetch)
     của phiên /random. Trả về (category_key, label, url) hoặc None nếu hết
@@ -1225,7 +1323,7 @@ async def _pick_random_image(all_cats: dict, allowed_keys: list, exclude_urls: l
     """
     if not allowed_keys:
         return None
-    doc = await bot.loop.run_in_executor(None, db.get_random_image, exclude_urls, allowed_keys)
+    doc = await bot.loop.run_in_executor(None, db.get_random_image, exclude_urls, allowed_keys, reserve)
     if doc:
         category_key = doc["category"]
         info = all_cats.get(category_key, {"label": category_key, "keywords": [category_key]})
@@ -1236,7 +1334,7 @@ async def _pick_random_image(all_cats: dict, allowed_keys: list, exclude_urls: l
     # (chỉ đọc DB, không cào Pinterest trực tiếp nữa — xem ghi chú đầu file).
     category_key = random.choice(allowed_keys)
     info = all_cats[category_key]
-    url = await _fetch_next_image_url(category_key, exclude_urls)
+    url = await _fetch_next_image_url(category_key, exclude_urls, reserve=reserve)
     if not url:
         return None
     return category_key, info["label"], url
@@ -1269,7 +1367,7 @@ def _schedule_random_prefetch(message_id: str, all_cats: dict, allowed_keys: lis
     category_key/label riêng cho từng ảnh (xem save_random_paginator_session)."""
     async def _do_prefetch():
         try:
-            result = await _pick_random_image(all_cats, allowed_keys, exclude_urls)
+            result = await _pick_random_image(all_cats, allowed_keys, exclude_urls, reserve=True)
             if result:
                 category_key, label, url = result
                 item = {"url": url, "category_key": category_key, "label": label}
@@ -1362,14 +1460,18 @@ async def random_prefix(ctx):
 async def _build_stats_embed() -> discord.Embed:
     all_cats = await get_all_categories_async()
 
+    empty_stats = {"total": 0, "available": 0, "avg_sent_count": 0, "max_sent_count": 0,
+                   "oldest_created_at": None, "newest_created_at": None}
+
     def fetch():
-        stats = {}
-        for key in all_cats:
-            try:
-                stats[key] = db.get_category_stats(key)
-            except Exception as e:
-                logger.warning(f"Lỗi lấy stats category '{key}': {e}")
-                stats[key] = None
+        # 1 aggregation duy nhất cho TẤT CẢ chủ đề (trước đây 3 truy vấn / chủ đề).
+        try:
+            grouped = db.get_all_category_stats()
+        except Exception as e:
+            logger.warning(f"Lỗi lấy stats kho ảnh: {e}")
+            grouped = None
+        # Chủ đề chưa có ảnh nào không xuất hiện trong kết quả -> coi là 0 ảnh.
+        stats = {key: (None if grouped is None else grouped.get(key, dict(empty_stats))) for key in all_cats}
         last_crawl = db.get_last_crawl_time()
         return stats, last_crawl
 
@@ -1914,6 +2016,7 @@ async def _post_showcase_board(target_channel, category_key: str, info: dict, ad
 
 
 @bot.tree.command(name="showcase", description="[Admin] Đăng bảng giới thiệu 1 chủ đề vào kênh (nút Bắt đầu cho mọi người bấm)")
+@app_commands.guild_only()
 @app_commands.describe(chu_de="Chủ đề cần giới thiệu", kenh="Kênh muốn đăng (bỏ trống = kênh hiện tại)")
 @app_commands.autocomplete(chu_de=category_autocomplete)
 async def showcase_slash(interaction: discord.Interaction, chu_de: str, kenh: discord.TextChannel = None):
@@ -2005,6 +2108,7 @@ CONFIG_ACTIONS = [
 
 
 @bot.tree.command(name="config", description="[Admin] Cấu hình giới hạn kênh/role dùng lệnh ảnh cho server này")
+@app_commands.guild_only()
 @app_commands.describe(action="Hành động", kenh="Kênh (dùng cho add_channel/remove_channel)", role="Role (dùng cho add_role/remove_role)")
 @app_commands.choices(action=CONFIG_ACTIONS)
 async def config_slash(interaction: discord.Interaction, action: app_commands.Choice[str],
@@ -2403,6 +2507,7 @@ class CategoryPickerView(discord.ui.View):
 
 
 @bot.tree.command(name="setup", description="[Admin] Wizard thiết lập showcase board cho nhiều chủ đề cùng lúc")
+@app_commands.guild_only()
 async def setup_slash(interaction: discord.Interaction):
     if not is_admin(interaction.user.id):
         await interaction.response.send_message("⚠️ Chỉ admin mới dùng được lệnh này.", ephemeral=True)
@@ -2424,7 +2529,7 @@ TOKEN = os.getenv("DISCORD_TOKEN")
 
 if __name__ == "__main__":
     if not TOKEN:
-        logger.error("Chưa thiết lập biến môi trường DISCORD_TOKEN trên Render!")
+        logger.error("Chưa thiết lập biến môi trường DISCORD_TOKEN trên Railway!")
     else:
         keep_alive()
 
@@ -2433,14 +2538,14 @@ if __name__ == "__main__":
         # session HTTP nội bộ của object `bot`, nên gọi lại bot.run() trên
         # cùng object sẽ luôn crash với "RuntimeError: Session is closed",
         # KHÔNG PHẢI retry thật. Cách đúng: chờ rồi thoát hẳn tiến trình,
-        # để Render tự khởi động lại process MỚI (bot object mới tinh).
+        # để Railway tự khởi động lại process MỚI (bot object mới tinh).
         try:
             bot.run(TOKEN)
         except discord.errors.HTTPException as e:
             if e.status == 429:
                 logger.warning(
                     "Bị Discord Rate Limit 429 khi đăng nhập. Chờ 5 phút rồi "
-                    "thoát tiến trình để Render tự khởi động lại (không retry "
+                    "thoát tiến trình để Railway tự khởi động lại (không retry "
                     "trong cùng process vì session HTTP đã bị đóng). Chờ lâu "
                     "hơn 60 giây để tránh dính 429 lặp lại liên tục nếu giới "
                     "hạn của Discord chưa được gỡ."

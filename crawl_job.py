@@ -38,6 +38,7 @@ from db import (
     set_last_crawl_time,
     get_category_bookmark,
     set_category_bookmark,
+    update_failure_streak,
     is_valid_image_url,
 )
 from pinterest_crawler import search_pinterest_images_with_retry
@@ -51,6 +52,7 @@ logger = logging.getLogger("crawl_job")
 
 IMAGES_PER_CATEGORY = 30  # số ảnh tối đa lấy về mỗi lần crawl / category
 LOW_STOCK_THRESHOLD = 5   # cảnh báo nếu 1 category còn dưới ngần này ảnh khả dụng
+FAILURE_STREAK_ALERT = 3  # cảnh báo khi 1 category lỗi liên tiếp ngần này lần (rồi lặp lại mỗi bội số)
 
 # Khoảng nghỉ NGẪU NHIÊN (giây) tối thiểu giữa 2 request Pinterest liên tiếp.
 # Trước đây các category/từ khóa được gọi dồn dập không nghỉ — dễ bị Pinterest
@@ -206,6 +208,7 @@ def main():
     total_inserted = 0
     total_skipped = 0
     failed_categories = []
+    streak_alerts = []
 
     for slug, info in all_categories.items():
         keywords = get_keywords(info)
@@ -216,6 +219,14 @@ def main():
         total_skipped += skipped
         if had_error:
             failed_categories.append(slug)
+
+        try:
+            streak = update_failure_streak(slug, had_error)
+        except Exception as e:
+            logger.warning(f"Không ghi được số lần lỗi liên tiếp của '{slug}': {e}")
+            streak = 0
+        if had_error and streak and streak % FAILURE_STREAK_ALERT == 0:
+            streak_alerts.append(f"- {info['label']} (`{slug}`): lỗi {streak} lần crawl liên tiếp")
 
     logger.info(f"=== Xong. Tổng: {total_inserted} ảnh mới, {total_skipped} ảnh trùng ===")
 
@@ -238,6 +249,13 @@ def main():
         raise RuntimeError(
             "Tất cả category đều crawl lỗi — có thể Pinterest đang chặn IP của GitHub Actions runner."
         )
+
+    # Cảnh báo category lỗi LIÊN TIẾP nhiều lần (không phải lỗi toàn bộ — trường
+    # hợp đó đã có cảnh báo + raise ở trên): 1 chủ đề âm thầm hỏng sẽ không bị bỏ sót.
+    if streak_alerts:
+        alert_lines = "\n".join(streak_alerts)
+        logger.warning(f"Category lỗi liên tiếp:\n{alert_lines}")
+        send_discord_alert(f"🟠 **Cảnh báo: chủ đề crawl lỗi liên tiếp**\n{alert_lines}")
 
     # Cảnh báo category sắp cạn ảnh khả dụng (không tính là lỗi job)
     low_stock = []

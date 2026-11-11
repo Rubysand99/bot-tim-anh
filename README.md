@@ -95,6 +95,16 @@ xứng. Khi Pinterest báo hết trang (`bookmark == "-end-"`), bookmark lưu l�
 là `None` — lần crawl sau tự quay lại trang đầu (lúc đó top kết quả thường
 đã đổi khác nên vẫn có ảnh mới).
 
+## Chạy test
+
+```bash
+python -m unittest discover -s tests -v
+```
+
+Test dùng module giả thay cho Discord/MongoDB nên không cần token hay mạng.
+GitHub Actions (`.github/workflows/ci.yml`) tự chạy chúng cùng bước biên dịch
+và lint cơ bản mỗi khi push nhánh khác `main` hoặc mở PR.
+
 ## Chạy bot local
 
 ```bash
@@ -119,9 +129,25 @@ DISCORD_TOKEN="..." MONGO_URI="mongodb+srv://..." python bot.py
 **Cooldown:** người dùng thường bị giới hạn 8 giây/lần cho `/img`, `!img`,
 `/random`, `!random`. Admin (`ADMIN_USER_IDS`) không bị giới hạn này.
 
-**Nút Trước/Sau:** không có hạn dùng — bấm được kể cả sau 1 ngày, 1 tuần,
-hay sau khi bot restart, vì trạng thái phiên xem ảnh được lưu trong MongoDB
-(`paginator_sessions`) thay vì bộ nhớ RAM của tiến trình bot.
+**Nút Trước/Sau:** bấm được kể cả sau khi bot restart, vì trạng thái phiên
+xem ảnh được lưu trong MongoDB (`paginator_sessions`) thay vì bộ nhớ RAM của
+tiến trình bot. Từ v1.12.0 phiên tự bị xoá sau **90 ngày không bấm gì**
+(`SESSION_TTL_DAYS` trong `db.py`, mỗi lần bấm Trước/Sau sẽ làm mới hạn) để
+collection không phình mãi; nút trên tin nhắn cũ hơn mức đó sẽ báo "không tìm
+thấy dữ liệu phiên" — dùng lại `/img` là được. Bảng showcase không bị ảnh
+hưởng.
+
+**Nút 🚫 Báo lỗi (v1.12.0):** người đang xem ảnh bấm khi ảnh không tải được.
+Ảnh bị gỡ khỏi phiên và chuyển sang ảnh khác. Nếu bot tự kiểm tra thấy link đã
+chết (HTTP 404/410) thì ảnh bị xoá khỏi kho ngay; nếu link còn sống thì chỉ ghi
+nhận lượt báo, và ảnh chỉ bị xoá khi có ít nhất **3 người khác nhau** cùng báo
+(`REPORT_DELETE_THRESHOLD`) — một người không thể tự xoá ảnh của kho. Tin nhắn
+cũ sẽ có nút này sau lần bấm Trước/Sau đầu tiên.
+
+**Ảnh tải trước (v1.12.0):** để nút "Sau" phản hồi nhanh, bot tải trước ảnh kế
+tiếp nhưng chỉ *giữ chỗ* 10 phút (`RESERVE_MINUTES`); ảnh chỉ được tính là "đã
+gửi" (tăng `sent_count`, bắt đầu cooldown 1 tiếng) khi người dùng thật sự bấm
+tới nó. Ảnh chưa ai xem tự quay lại kho.
 
 ### Lệnh admin (chỉ `ADMIN_USER_IDS`)
 

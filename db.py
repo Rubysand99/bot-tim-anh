@@ -17,7 +17,7 @@ from pymongo.errors import DuplicateKeyError
 logger = logging.getLogger("db")
 
 # Ngưỡng (ms) để coi 1 lệnh Mongo là "chậm" và log cảnh báo — giúp chẩn đoán
-# khi nghi ngờ MongoDB Atlas (hoặc độ trễ mạng Render<->Atlas) là nguyên nhân
+# khi nghi ngờ MongoDB Atlas (hoặc độ trễ mạng Railway<->Atlas) là nguyên nhân
 # timeout/lag ở bot, thay vì đoán mò. Chỉnh số này nếu thấy log ồn quá hoặc
 # muốn bắt cả những lệnh chỉ hơi chậm.
 SLOW_QUERY_THRESHOLD_MS = 500
@@ -44,6 +44,13 @@ PAGINATOR_SESSIONS_COLLECTION = "paginator_sessions"
 SHOWCASE_BOARDS_COLLECTION = "showcase_boards"
 GUILD_CONFIGS_COLLECTION = "guild_configs"
 
+# Phiên xem ảnh (paginator_sessions) tự xoá sau chừng này ngày KỂ TỪ LẦN TƯƠNG
+# TÁC CUỐI (updated_at, được làm mới mỗi lần bấm Trước/Sau) — trước đây không
+# bao giờ được dọn nên collection phình mãi (Atlas free chỉ 512MB). Nút trên
+# tin nhắn cũ hơn mức này sẽ báo "không tìm thấy dữ liệu phiên", dùng lại
+# /img là được. KHÔNG áp dụng cho showcase_boards (bảng giới thiệu phải sống mãi).
+SESSION_TTL_DAYS = 90
+
 _client = None
 _db = None
 
@@ -67,6 +74,15 @@ def get_db():
         collection.create_index([("image_url", ASCENDING)], unique=True)
         # index hỗ trợ query theo category + trạng thái đã gửi
         collection.create_index([("category", ASCENDING), ("last_sent_at", ASCENDING)])
+        # TTL dọn phiên xem ảnh cũ — lỗi ở đây không được làm hỏng khởi động bot.
+        try:
+            _db[PAGINATOR_SESSIONS_COLLECTION].create_index(
+                [("updated_at", ASCENDING)],
+                expireAfterSeconds=SESSION_TTL_DAYS * 24 * 3600,
+                name="paginator_sessions_ttl",
+            )
+        except Exception as e:
+            logger.warning(f"Không tạo được TTL index cho paginator_sessions: {e}")
     return _db
 
 
@@ -90,8 +106,16 @@ def _available_query(category: str = None, exclude_urls: list = None) -> dict:
 
 CLAIM_MAX_ATTEMPTS = 5
 
+# Ảnh được tải trước (prefetch) cho nút "Sau" chỉ được GIỮ CHỖ tạm thời chừng
+# này phút, KHÔNG bị coi là đã gửi: chưa ai xem thì tự trả về kho sau khoảng
+# thời gian này, và sent_count chỉ tăng khi người dùng thật sự bấm "Sau" tới
+# ảnh đó (confirm_image_sent). Trước đây mỗi phiên khoá 1 ảnh chưa ai xem trong
+# cả COOLDOWN_HOURS và tăng sent_count ngay — làm chủ đề ít ảnh cạn nhanh gấp
+# đôi và đẩy ảnh tới ngưỡng bị /cleanup xoá oan.
+RESERVE_MINUTES = 10
 
-def _claim_random_image(query: dict):
+
+def _claim_random_image(query: dict, reserve: bool = False):
     """
     Bốc NGẪU NHIÊN 1 ảnh khớp `query` và "chiếm" nó một cách NGUYÊN TỬ.
 
@@ -101,6 +125,10 @@ def _claim_random_image(query: dict):
     tránh trùng. Giờ: bước chiếm là find_one_and_update với CHÍNH điều kiện
     khả dụng của query (cộng thêm _id) — chỉ 1 bên thắng, bên thua nhận None
     và bốc lại ảnh khác (tối đa CLAIM_MAX_ATTEMPTS lần).
+
+    reserve=True: chỉ GIỮ CHỖ (dùng cho prefetch) — đặt last_sent_at lùi sao cho
+    ảnh tự khả dụng lại sau RESERVE_MINUTES phút, đánh dấu reserved=True và
+    KHÔNG tăng sent_count; xem confirm_image_sent() để xác nhận khi thật sự xem.
 
     Trả về document SAU khi cập nhật (đã có last_sent_at/sent_count mới), hoặc
     None nếu không còn ảnh khả dụng.
@@ -116,10 +144,17 @@ def _claim_random_image(query: dict):
 
         claim_filter = dict(query)
         claim_filter["_id"] = results[0]["_id"]
+        if reserve:
+            hold_until = now_utc() - timedelta(hours=COOLDOWN_HOURS) + timedelta(minutes=RESERVE_MINUTES)
+            update = {"$set": {"last_sent_at": hold_until, "reserved": True}}
+        else:
+            update = {
+                "$set": {"last_sent_at": now_utc()},
+                "$inc": {"sent_count": 1},
+                "$unset": {"reserved": ""},
+            }
         doc = collection.find_one_and_update(
-            claim_filter,
-            {"$set": {"last_sent_at": now_utc()}, "$inc": {"sent_count": 1}},
-            return_document=ReturnDocument.AFTER,
+            claim_filter, update, return_document=ReturnDocument.AFTER,
         )
         if doc:
             return doc
@@ -148,7 +183,7 @@ def is_valid_image_url(url: str) -> bool:
 
 
 @_timed
-def get_next_image(category: str, exclude_urls: list):
+def get_next_image(category: str, exclude_urls: list, reserve: bool = False):
     """
     Lấy NGẪU NHIÊN 1 ảnh khả dụng trong category (chưa từng gửi hoặc đã gửi
     > 1 tiếng trước) — không theo thứ tự cố định. Đánh dấu last_sent_at = now
@@ -158,7 +193,20 @@ def get_next_image(category: str, exclude_urls: list):
     Trả về document (dict) hoặc None nếu không còn ảnh khả dụng.
     """
     query = _available_query(category=category, exclude_urls=exclude_urls)
-    return _claim_random_image(query)
+    return _claim_random_image(query, reserve=reserve)
+
+
+@_timed
+def confirm_image_sent(url: str) -> bool:
+    """Xác nhận 1 ảnh đã được giữ chỗ (prefetch) giờ ĐÃ thật sự được người dùng
+    xem: đặt last_sent_at = bây giờ, tăng sent_count, bỏ cờ reserved. Idempotent
+    — chỉ tác động lên ảnh còn cờ reserved=True, nên bấm Trước/Sau qua lại nhiều
+    lần cũng không tăng sent_count thêm. Trả về True nếu có cập nhật."""
+    result = get_db()[COLLECTION_NAME].update_one(
+        {"image_url": url, "reserved": True},
+        {"$set": {"last_sent_at": now_utc()}, "$inc": {"sent_count": 1}, "$unset": {"reserved": ""}},
+    )
+    return result.modified_count > 0
 
 
 @_timed
@@ -186,7 +234,7 @@ def peek_random_image(category: str):
 
 
 @_timed
-def get_random_image(exclude_urls: list = None, category_keys: list = None):
+def get_random_image(exclude_urls: list = None, category_keys: list = None, reserve: bool = False):
     """
     Lấy NGẪU NHIÊN 1 ảnh khả dụng bất kỳ CATEGORY NÀO (dùng cho /random —
     random thẳng trên toàn bộ ảnh, không phải random category rồi mới chọn
@@ -203,7 +251,7 @@ def get_random_image(exclude_urls: list = None, category_keys: list = None):
             return None
         query["category"] = {"$in": category_keys}
 
-    return _claim_random_image(query)
+    return _claim_random_image(query, reserve=reserve)
 
 
 @_timed
@@ -258,6 +306,43 @@ def get_category_stats(category: str) -> dict:
         "max_sent_count": max_sent_count,
         "oldest_created_at": oldest_created_at,
         "newest_created_at": newest_created_at,
+    }
+
+
+@_timed
+def get_all_category_stats() -> dict:
+    """Thống kê của TẤT CẢ category trong 1 lượt aggregation duy nhất (thay vì
+    3 truy vấn cho mỗi category như get_category_stats khi lặp) — dùng cho /stats.
+
+    Trả về {category: {total, available, avg_sent_count, max_sent_count,
+    oldest_created_at, newest_created_at}} — cùng cấu trúc get_category_stats.
+    Category chưa có ảnh nào thì không có mặt trong dict (bên gọi tự coi là 0)."""
+    cooldown_before = now_utc() - timedelta(hours=COOLDOWN_HOURS)
+    never_or_expired = {"$or": [
+        {"$eq": [{"$ifNull": ["$last_sent_at", None]}, None]},
+        {"$lt": ["$last_sent_at", cooldown_before]},
+    ]}
+    rows = get_db()[COLLECTION_NAME].aggregate([
+        {"$group": {
+            "_id": "$category",
+            "total": {"$sum": 1},
+            "available": {"$sum": {"$cond": [never_or_expired, 1, 0]}},
+            "avg_sent_count": {"$avg": "$sent_count"},
+            "max_sent_count": {"$max": "$sent_count"},
+            "oldest_created_at": {"$min": "$created_at"},
+            "newest_created_at": {"$max": "$created_at"},
+        }},
+    ])
+    return {
+        r["_id"]: {
+            "total": r["total"],
+            "available": r["available"],
+            "avg_sent_count": round(r.get("avg_sent_count") or 0, 1),
+            "max_sent_count": r.get("max_sent_count") or 0,
+            "oldest_created_at": r.get("oldest_created_at"),
+            "newest_created_at": r.get("newest_created_at"),
+        }
+        for r in rows
     }
 
 
@@ -395,6 +480,26 @@ def set_category_bookmark(category_key: str, bookmark) -> None:
     )
 
 
+@_timed
+def update_failure_streak(slug: str, failed: bool) -> int:
+    """Ghi nhận kết quả crawl của 1 category và trả về số lần lỗi LIÊN TIẾP hiện
+    tại (0 nếu lần này thành công). Dùng để crawl_job cảnh báo khi 1 category lỗi
+    nhiều lần liên tiếp — trước đây chỉ cảnh báo khi TOÀN BỘ category cùng lỗi,
+    nên 1 chủ đề âm thầm hỏng (vd từ khóa bị Pinterest chặn) không ai biết."""
+    meta = get_db()[META_COLLECTION]
+    key = f"fail_streak_{slug}"
+    if not failed:
+        meta.delete_one({"_id": key})
+        return 0
+    doc = meta.find_one_and_update(
+        {"_id": key},
+        {"$inc": {"count": 1}, "$set": {"updated_at": now_utc()}},
+        upsert=True,
+        return_document=ReturnDocument.AFTER,
+    )
+    return doc["count"]
+
+
 # ============================================================
 # Phiên xem ảnh (paginator session) — lưu trạng thái nút Trước/Sau theo
 # message_id để nút bấm hoạt động vĩnh viễn, kể cả sau khi bot restart
@@ -462,6 +567,31 @@ def append_image_to_session(message_id: str, url: str) -> bool:
         {"$push": {"images": url}, "$set": {"updated_at": now_utc()}},
     )
     return result.matched_count > 0
+
+
+@_timed
+def report_image(url: str, user_id: int) -> int:
+    """Ghi nhận 1 người dùng báo ảnh này bị lỗi. Mỗi người chỉ được tính 1 lần
+    cho mỗi ảnh ($addToSet) nên không thể tự báo nhiều lần để xoá ảnh của kho.
+    Trả về SỐ NGƯỜI KHÁC NHAU đã báo ảnh này (0 nếu ảnh không còn trong kho)."""
+    doc = get_db()[COLLECTION_NAME].find_one_and_update(
+        {"image_url": url},
+        {"$addToSet": {"reporters": user_id}},
+        return_document=ReturnDocument.AFTER,
+    )
+    return len(doc.get("reporters", [])) if doc else 0
+
+
+@_timed
+def remove_url_from_session(message_id: str, url: str) -> None:
+    """Gỡ 1 URL khỏi phiên xem (cả phiên /img — mảng "images" — lẫn phiên /random
+    — mảng "items"), dùng khi người dùng báo ảnh lỗi. $pull trên field không tồn
+    tại là no-op nên 1 lệnh dùng được cho cả 2 loại phiên."""
+    db = get_db()
+    db[PAGINATOR_SESSIONS_COLLECTION].update_one(
+        {"_id": message_id},
+        {"$pull": {"images": url, "items": {"url": url}}, "$set": {"updated_at": now_utc()}},
+    )
 
 
 # --- Phiên /random: khác phiên /img ở chỗ MỖI ẢNH có thể thuộc 1 category
@@ -568,7 +698,7 @@ def get_showcase_board(message_id: str):
 # ============================================================
 # Cấu hình riêng theo từng server (guild) — cho phép mỗi server tự đặt
 # giới hạn kênh/role dùng lệnh ảnh qua /config, thay vì dùng chung 1 cấu
-# hình toàn cục (ALLOWED_CHANNEL_IDS/ALLOWED_ROLE_IDS trên Render) cho mọi
+# hình toàn cục (ALLOWED_CHANNEL_IDS/ALLOWED_ROLE_IDS trên Railway) cho mọi
 # server bot có mặt.
 # ============================================================
 

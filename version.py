@@ -4,5 +4,5 @@ Số bản của bot — cập nhật mỗi khi thêm tính năng/sửa lỗi đ
 Chỉ cần sửa 2 biến bên dưới, không cần đụng vào bot.py.
 """
 
-__version__ = "1.11.1"
-__description__ = "Sửa lỗi: không còn cache danh sách chủ đề rỗng khi MongoDB chập chờn; crawl_job báo lỗi thay vì im lặng khi không đọc được chủ đề; /cleanup chỉ xoá ảnh 404/410 và kiểm tra mẫu ngẫu nhiên; /config clear_* thật sự bỏ được giới hạn kể cả khi có biến môi trường ALLOWED_*; lấy ảnh nguyên tử (2 người không còn nhận trùng 1 ảnh); workflow crawl không còn chạy mỗi lần push và crawler nghỉ 1–3s giữa các request Pinterest."
+__version__ = "1.12.0"
+__description__ = "Thêm nút 🚫 Báo lỗi ảnh; ảnh tải trước chỉ giữ chỗ 10 phút (không tính đã gửi cho tới khi người dùng thật sự xem); phiên xem ảnh tự xoá sau 90 ngày; /stats nhanh hơn (1 truy vấn); crawl_job cảnh báo chủ đề lỗi liên tiếp; thêm unit test + CI."
