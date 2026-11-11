@@ -1,8 +1,10 @@
 name: Run Python Script
 
 on:
-  push:
-    branches: [ main ]
+  # Đã bỏ trigger "push" (trước đây mỗi lần push/deploy lên main đều kích hoạt
+  # 1 lần crawl ngoài lịch, làm lệch mốc last_crawl_time mà bot dùng để ước
+  # tính "lần crawl kế tiếp" và tăng nguy cơ Pinterest chặn IP). Chỉ còn lịch
+  # cron + chạy thủ công.
   workflow_dispatch:  # cho phép chạy thủ công từ tab Actions
   schedule:
     - cron: "0 */2 * * *"  # chạy tự động mỗi 2 tiếng (giờ UTC)

@@ -338,4 +338,10 @@ giờ chỉ còn được `crawl_job.py` dùng, chạy nền qua GitHub Actions.
   qua tab Actions (`workflow_dispatch`). Lưu ý: GitHub Actions cron chỉ chạy
   theo giờ đồng hồ cố định, không hỗ trợ kiểu "2 tiếng sau khi lần trước
   chạy xong" — do job chạy rất nhanh (15-40 giây) nên chênh lệch giữa 2 cách
-  tính là không đáng kể trong thực tế.
+  tính là không đáng kể trong thực tế. Từ v1.11.1 workflow **không còn chạy
+  khi push lên `main`** (trước đây mỗi lần deploy đều kích hoạt thêm 1 lần
+  crawl ngoài lịch). Giữa 2 request Pinterest liên tiếp, `crawl_job.py` nghỉ
+  ngẫu nhiên 1–3 giây (`REQUEST_DELAY_MIN/MAX_SECONDS`) để giảm nguy cơ bị
+  chặn IP. **Lưu ý:** GitHub tự tắt workflow theo lịch (cron) nếu repo không
+  có hoạt động nào trong 60 ngày — nếu thấy crawl ngừng chạy, vào tab Actions
+  bấm bật lại workflow (hoặc đơn giản là có 1 commit/push mới vào repo).

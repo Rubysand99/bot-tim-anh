@@ -88,13 +88,43 @@ def _available_query(category: str = None, exclude_urls: list = None) -> dict:
     return query
 
 
-@_timed
-def _mark_sent(doc_id) -> None:
-    db = get_db()
-    db[COLLECTION_NAME].update_one(
-        {"_id": doc_id},
-        {"$set": {"last_sent_at": now_utc()}, "$inc": {"sent_count": 1}},
-    )
+CLAIM_MAX_ATTEMPTS = 5
+
+
+def _claim_random_image(query: dict):
+    """
+    Bốc NGẪU NHIÊN 1 ảnh khớp `query` và "chiếm" nó một cách NGUYÊN TỬ.
+
+    Trước đây: $sample rồi mới update_one(_id) ở bước sau — giữa 2 bước đó,
+    người khác (hoặc tác vụ prefetch của chính phiên đang xem) có thể bốc
+    trúng đúng ảnh này, dẫn tới 2 người cùng nhận 1 ảnh dù docstring hứa là
+    tránh trùng. Giờ: bước chiếm là find_one_and_update với CHÍNH điều kiện
+    khả dụng của query (cộng thêm _id) — chỉ 1 bên thắng, bên thua nhận None
+    và bốc lại ảnh khác (tối đa CLAIM_MAX_ATTEMPTS lần).
+
+    Trả về document SAU khi cập nhật (đã có last_sent_at/sent_count mới), hoặc
+    None nếu không còn ảnh khả dụng.
+    """
+    collection = get_db()[COLLECTION_NAME]
+    for _ in range(CLAIM_MAX_ATTEMPTS):
+        results = list(collection.aggregate([
+            {"$match": query},
+            {"$sample": {"size": 1}},
+        ]))
+        if not results:
+            return None
+
+        claim_filter = dict(query)
+        claim_filter["_id"] = results[0]["_id"]
+        doc = collection.find_one_and_update(
+            claim_filter,
+            {"$set": {"last_sent_at": now_utc()}, "$inc": {"sent_count": 1}},
+            return_document=ReturnDocument.AFTER,
+        )
+        if doc:
+            return doc
+        # Ảnh vừa bị bên khác chiếm mất giữa 2 bước -> bốc lại.
+    return None
 
 
 # Discord giới hạn URL trong embeds.image.url tối đa 2048 ký tự — từng gặp
@@ -122,26 +152,13 @@ def get_next_image(category: str, exclude_urls: list):
     """
     Lấy NGẪU NHIÊN 1 ảnh khả dụng trong category (chưa từng gửi hoặc đã gửi
     > 1 tiếng trước) — không theo thứ tự cố định. Đánh dấu last_sent_at = now
-    ngay khi lấy để tránh 2 user cùng nhận trùng 1 ảnh trong cùng cooldown.
+    NGUYÊN TỬ ngay khi lấy (xem _claim_random_image) để 2 user không bao giờ
+    cùng nhận trùng 1 ảnh trong cùng cooldown.
 
     Trả về document (dict) hoặc None nếu không còn ảnh khả dụng.
     """
-    db = get_db()
-    collection = db[COLLECTION_NAME]
     query = _available_query(category=category, exclude_urls=exclude_urls)
-
-    results = list(collection.aggregate([
-        {"$match": query},
-        {"$sample": {"size": 1}},
-    ]))
-    if not results:
-        return None
-
-    doc = results[0]
-    _mark_sent(doc["_id"])
-    doc["last_sent_at"] = now_utc()
-    doc["sent_count"] = doc.get("sent_count", 0) + 1
-    return doc
+    return _claim_random_image(query)
 
 
 @_timed
@@ -180,26 +197,13 @@ def get_random_image(exclude_urls: list = None, category_keys: list = None):
 
     Trả về document (dict, có field "category") hoặc None nếu không có ảnh khả dụng.
     """
-    db = get_db()
-    collection = db[COLLECTION_NAME]
     query = _available_query(exclude_urls=exclude_urls)
     if category_keys is not None:
         if not category_keys:
             return None
         query["category"] = {"$in": category_keys}
 
-    results = list(collection.aggregate([
-        {"$match": query},
-        {"$sample": {"size": 1}},
-    ]))
-    if not results:
-        return None
-
-    doc = results[0]
-    _mark_sent(doc["_id"])
-    doc["last_sent_at"] = now_utc()
-    doc["sent_count"] = doc.get("sent_count", 0) + 1
-    return doc
+    return _claim_random_image(query)
 
 
 @_timed

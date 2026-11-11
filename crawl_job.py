@@ -20,7 +20,10 @@ Chạy thủ công (test local qua Termux):
 
 import logging
 import os
+import random
 import sys
+import threading
+import time
 from datetime import datetime, timezone
 
 import requests
@@ -48,6 +51,35 @@ logger = logging.getLogger("crawl_job")
 
 IMAGES_PER_CATEGORY = 30  # số ảnh tối đa lấy về mỗi lần crawl / category
 LOW_STOCK_THRESHOLD = 5   # cảnh báo nếu 1 category còn dưới ngần này ảnh khả dụng
+
+# Khoảng nghỉ NGẪU NHIÊN (giây) tối thiểu giữa 2 request Pinterest liên tiếp.
+# Trước đây các category/từ khóa được gọi dồn dập không nghỉ — dễ bị Pinterest
+# nhận ra là bot và chặn IP của GitHub Actions runner.
+REQUEST_DELAY_MIN_SECONDS = 1.0
+REQUEST_DELAY_MAX_SECONDS = 3.0
+
+_pause_lock = threading.Lock()
+_last_request_done_at = None  # monotonic time của request Pinterest gần nhất vừa xong
+
+
+def _polite_pause() -> None:
+    """Đảm bảo giữa 2 request Pinterest liên tiếp có khoảng nghỉ ngẫu nhiên
+    1–3 giây (tính từ lúc request trước XONG, nên request chậm tự nhiên đã
+    chứa sẵn khoảng nghỉ). Request đầu tiên của tiến trình không phải chờ gì.
+    Dùng chung cho crawl định kỳ và crawl ngay khi admin /addcategory."""
+    with _pause_lock:
+        if _last_request_done_at is None:
+            return
+        gap = random.uniform(REQUEST_DELAY_MIN_SECONDS, REQUEST_DELAY_MAX_SECONDS)
+        wait = gap - (time.monotonic() - _last_request_done_at)
+    if wait > 0:
+        time.sleep(wait)
+
+
+def _mark_request_done() -> None:
+    global _last_request_done_at
+    with _pause_lock:
+        _last_request_done_at = time.monotonic()
 
 
 def send_discord_alert(message: str) -> None:
@@ -88,6 +120,7 @@ def _crawl_one_keyword(slug: str, keyword: str, collection):
     độc lập với nhau. Trả về (inserted, skipped, had_error)."""
     bookmark_key = f"{slug}::{keyword}"
     bookmark = get_category_bookmark(bookmark_key)
+    _polite_pause()
     try:
         image_urls, next_bookmark = search_pinterest_images_with_retry(
             keyword, limit=IMAGES_PER_CATEGORY, bookmark=bookmark
@@ -95,6 +128,8 @@ def _crawl_one_keyword(slug: str, keyword: str, collection):
     except Exception as err:
         logger.warning(f"Lỗi crawl category '{slug}' (từ khóa '{keyword}'): {err}")
         return 0, 0, True
+    finally:
+        _mark_request_done()
 
     set_category_bookmark(bookmark_key, next_bookmark)
 
