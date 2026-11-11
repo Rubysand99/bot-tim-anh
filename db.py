@@ -570,14 +570,21 @@ def get_showcase_board(message_id: str):
 
 @_timed
 def get_guild_config(guild_id: int) -> dict:
-    """Trả về {"allowed_channel_ids": [...], "allowed_role_ids": [...]}. Rỗng nếu server chưa cấu hình gì."""
+    """Trả về {"allowed_channel_ids": [...], "allowed_role_ids": [...], "configured": bool}.
+
+    "configured" = server này đã từng dùng /config để đặt kênh/role (kể cả khi
+    sau đó đã xoá hết, nên 2 danh sách đang rỗng). Cần phân biệt với "chưa bao
+    giờ cấu hình" để check_access biết khi nào mới được dùng mặc định toàn cục
+    (ALLOWED_*_IDS): doc của guild có thể tồn tại chỉ vì lưu setup_category_id
+    mà không có field allowed_* nào, nên không thể chỉ dựa vào "doc tồn tại"."""
     db = get_db()
     doc = db[GUILD_CONFIGS_COLLECTION].find_one({"_id": guild_id})
     if not doc:
-        return {"allowed_channel_ids": [], "allowed_role_ids": []}
+        return {"allowed_channel_ids": [], "allowed_role_ids": [], "configured": False}
     return {
         "allowed_channel_ids": doc.get("allowed_channel_ids", []),
         "allowed_role_ids": doc.get("allowed_role_ids", []),
+        "configured": "allowed_channel_ids" in doc or "allowed_role_ids" in doc,
     }
 
 

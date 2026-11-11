@@ -149,8 +149,15 @@ async def check_access(user_id: int, guild_id, channel_id: int, roles) -> str:
         allowed_channels, allowed_roles = ALLOWED_CHANNEL_IDS, ALLOWED_ROLE_IDS
     else:
         cfg = await _get_guild_config_cached(guild_id)
-        allowed_channels = set(cfg["allowed_channel_ids"]) if cfg["allowed_channel_ids"] else ALLOWED_CHANNEL_IDS
-        allowed_roles = set(cfg["allowed_role_ids"]) if cfg["allowed_role_ids"] else ALLOWED_ROLE_IDS
+        if cfg.get("configured"):
+            # Server đã tự cấu hình qua /config -> dùng RIÊNG, thay thế hoàn toàn
+            # mặc định toàn cục (đúng như README). Danh sách rỗng nghĩa là admin
+            # chủ động bỏ giới hạn (clear_channels/clear_roles), KHÔNG được quay
+            # về ALLOWED_*_IDS của biến môi trường như trước.
+            allowed_channels = set(cfg["allowed_channel_ids"])
+            allowed_roles = set(cfg["allowed_role_ids"])
+        else:
+            allowed_channels, allowed_roles = ALLOWED_CHANNEL_IDS, ALLOWED_ROLE_IDS
 
     if allowed_channels and channel_id not in allowed_channels:
         return "⚠️ Lệnh này chỉ dùng được ở kênh được chỉ định."
@@ -534,13 +541,24 @@ async def get_all_categories_async() -> dict:
 
     def fetch():
         merged = dict(CATEGORIES)
-        try:
-            merged.update(db.get_custom_categories())
-        except Exception as e:
-            logger.warning(f"Không đọc được custom categories từ DB: {e}")
+        merged.update(db.get_custom_categories())
         return merged
 
-    result = await bot.loop.run_in_executor(None, fetch)
+    try:
+        result = await bot.loop.run_in_executor(None, fetch)
+    except Exception as e:
+        # Từ v1.11.0 toàn bộ chủ đề nằm trong MongoDB, nên KHÔNG được cache kết
+        # quả rỗng khi đọc DB lỗi (trước đây cache {} 30 giây -> mọi lệnh báo
+        # "chủ đề không tồn tại" chỉ vì Mongo chập chờn 1 lần). Có bản cache cũ
+        # thì dùng tạm (và thử lại sớm ở lần gọi sau), chưa có thì trả {} nhưng
+        # không lưu vào cache.
+        stale = _categories_cache["data"]
+        if stale is not None:
+            logger.warning(f"Không đọc được custom categories từ DB, dùng tạm bản cache cũ: {e}")
+            return stale
+        logger.warning(f"Không đọc được custom categories từ DB (chưa có cache): {e}")
+        return dict(CATEGORIES)
+
     _categories_cache["data"] = result
     _categories_cache["at"] = now
     return result
@@ -1797,18 +1815,26 @@ CLEANUP_MAX_CHECK = 100          # tối đa số ảnh kiểm tra link mỗi l�
 
 
 def _check_broken(url: str):
+    """Trả về url nếu ảnh CHẮC CHẮN đã hỏng (HTTP 404/410), ngược lại None.
+
+    Chỉ 404/410 mới là bằng chứng link đã chết. Lỗi mạng, timeout, 429 (bị giới
+    hạn tốc độ), 403/405 (CDN không cho HEAD)... đều KHÔNG chứng minh ảnh hỏng —
+    trước đây mọi trường hợp đó đều bị coi là hỏng và xoá nhầm ảnh còn dùng tốt."""
     try:
         resp = requests.head(url, timeout=4, allow_redirects=True)
-        return url if resp.status_code >= 400 else None
     except Exception:
-        return url
+        return None
+    return url if resp.status_code in (404, 410) else None
 
 
 def _cleanup_category(category_key: str) -> str:
     """Chạy đồng bộ (blocking) trong executor. Trả về báo cáo kết quả."""
     overused_removed = db.delete_overused_images(category_key, CLEANUP_OVERUSED_THRESHOLD)
 
-    urls = db.get_all_image_urls(category_key)[:CLEANUP_MAX_CHECK]
+    # Lấy MẪU NGẪU NHIÊN thay vì luôn 100 ảnh đầu tiên — nếu không, mỗi lần chạy
+    # đều kiểm tra đúng cùng 1 nhóm ảnh và không bao giờ chạm tới phần còn lại.
+    all_urls = db.get_all_image_urls(category_key)
+    urls = random.sample(all_urls, min(len(all_urls), CLEANUP_MAX_CHECK))
     broken = []
     if urls:
         with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
@@ -1954,6 +1980,14 @@ async def showcase_prefix(ctx, chu_de: str = None, kenh: discord.TextChannel = N
 # ============================================================
 
 def _format_guild_config(cfg: dict) -> str:
+    if not cfg.get("configured"):
+        # Chưa cấu hình riêng -> đang áp dụng mặc định toàn cục (biến môi trường)
+        channels = ", ".join(f"<#{c}>" for c in sorted(ALLOWED_CHANNEL_IDS)) or "(không giới hạn — dùng được mọi kênh)"
+        roles = ", ".join(f"<@&{r}>" for r in sorted(ALLOWED_ROLE_IDS)) or "(không giới hạn — ai cũng dùng được)"
+        return (
+            f"**Kênh cho phép:** {channels}\n**Role cho phép:** {roles}\n"
+            f"_(Server chưa cấu hình riêng — đang dùng mặc định toàn cục của bot.)_"
+        )
     channels_text = ", ".join(f"<#{c}>" for c in cfg["allowed_channel_ids"]) or "(không giới hạn — dùng được mọi kênh)"
     roles_text = ", ".join(f"<@&{r}>" for r in cfg["allowed_role_ids"]) or "(không giới hạn — ai cũng dùng được)"
     return f"**Kênh cho phép:** {channels_text}\n**Role cho phép:** {roles_text}"

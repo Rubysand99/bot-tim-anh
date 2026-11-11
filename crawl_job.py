@@ -63,12 +63,13 @@ def send_discord_alert(message: str) -> None:
 
 
 def get_all_categories() -> dict:
-    """Gộp category tĩnh (categories.py) + category admin thêm qua Discord (MongoDB)."""
+    """Gộp category tĩnh (categories.py) + category admin thêm qua Discord (MongoDB).
+
+    Từ v1.11.0 toàn bộ chủ đề nằm trong MongoDB, nên nếu không đọc được DB thì
+    KHÔNG được âm thầm coi như "không có chủ đề nào" (job sẽ báo thành công với
+    0 ảnh và còn ghi last_crawl_time sai) — để lỗi nổi lên cho main() xử lý."""
     merged = dict(CATEGORIES)
-    try:
-        merged.update(get_custom_categories())
-    except Exception as e:
-        logger.warning(f"Không đọc được custom categories từ DB: {e}")
+    merged.update(get_custom_categories())
     return merged
 
 
@@ -156,6 +157,17 @@ def main():
     logger.info(f"=== Bắt đầu crawl lúc {datetime.now(timezone.utc).isoformat()} ===")
     all_categories = get_all_categories()
 
+    if not all_categories:
+        # Không có chủ đề nào để crawl (DB trống, hoặc chưa chạy /migratecategories).
+        # Không ghi last_crawl_time ở nhánh này: chưa crawl gì thì không được coi
+        # là "vừa crawl xong" (bot dùng mốc này để ước tính lần crawl kế tiếp).
+        logger.warning("Không có chủ đề nào trong DB để crawl — bỏ qua lần chạy này.")
+        send_discord_alert(
+            "🟡 **crawl_job:** không có chủ đề nào trong MongoDB để crawl "
+            "(chưa chạy `/migratecategories` hoặc DB trống?)."
+        )
+        return
+
     total_inserted = 0
     total_skipped = 0
     failed_categories = []
@@ -216,4 +228,8 @@ if __name__ == "__main__":
         main()
     except Exception as e:
         logger.error(f"Crawl job thất bại: {e}")
+        # Lỗi toàn bộ-category đã tự gửi cảnh báo riêng trong main(); các lỗi còn
+        # lại (vd không đọc được MongoDB) trước đây chỉ nằm im trong log Actions.
+        if "Tất cả category đều crawl lỗi" not in str(e):
+            send_discord_alert(f"🔴 **crawl_job thất bại:** {e}")
         sys.exit(1)

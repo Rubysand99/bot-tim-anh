@@ -222,7 +222,10 @@ Server nào **chưa từng dùng `/config`** sẽ dùng `ALLOWED_CHANNEL_IDS`/
 `ALLOWED_ROLE_IDS` từ biến môi trường Railway làm mặc định (giữ tương thích
 ngược). Ngay khi server đó chạy `/config add_channel` hoặc `add_role` lần
 đầu, cấu hình riêng của server sẽ thay thế hoàn toàn mặc định toàn cục cho
-server đó — các server khác không bị ảnh hưởng.
+server đó — các server khác không bị ảnh hưởng. Từ v1.11.1, "thay thế hoàn
+toàn" cũng áp dụng cho cả kênh lẫn role (đặt riêng kênh mà không đặt role =
+không giới hạn role) và `clear_channels`/`clear_roles` thật sự bỏ giới hạn,
+không quay về biến môi trường nữa.
 
 ## Chủ đề NSFW
 
